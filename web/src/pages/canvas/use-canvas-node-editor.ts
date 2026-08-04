@@ -131,7 +131,7 @@ export function useCanvasNodeEditor({
             const moderationFailure = node.metadata?.generationErrorCode === CONTENT_MODERATION_ERROR_CODE || isContentModerationError(node.metadata?.errorDetails);
             const metadata = moderationFailure && prompt !== previousPrompt
                 ? resetGenerationTaskMetadata(node.metadata, node.metadata?.content ? "success" : "idle")
-                : node.metadata;
+                : (node.metadata ?? {});
             const promptTemplateMetadata = prompt !== previousPrompt && metadata.promptTemplateOperation
                 ? { promptTemplateOperation: undefined, promptTemplateVariables: undefined }
                 : {};

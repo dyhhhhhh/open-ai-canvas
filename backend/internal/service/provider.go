@@ -231,7 +231,7 @@ func (s *Service) canvasGenerationInput(ctx context.Context, userID string, task
 		values := metadataStringValues(input.Metadata["promptTemplateVariables"])
 		compiled, compileErr := s.compilePrompt(userID, promptTemplateOperation, values)
 		if compileErr != nil {
-			return nil, fmt.Errorf("编译用户提示词失败：%w", compileErr)
+			return canvasGenerationInput{}, fmt.Errorf("编译用户提示词失败：%w", compileErr)
 		}
 		input.Prompt = compiled.Content
 	}
