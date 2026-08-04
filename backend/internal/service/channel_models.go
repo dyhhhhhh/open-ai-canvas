@@ -71,7 +71,7 @@ func (s *Service) FetchAdminChannelModels(ctx context.Context, actor *model.User
 	if err := s.RequireAdmin(actor); err != nil {
 		return nil, err
 	}
-	channel, err := s.repo.AdminSystemChannel(channelID)
+	channel, err := s.adminSystemChannel(channelID)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +174,7 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 	if err := s.RequireAdmin(actor); err != nil {
 		return nil, err
 	}
-	channel, err := s.repo.AdminSystemChannel(channelID)
+	channel, err := s.adminSystemChannel(channelID)
 	if err != nil {
 		return nil, err
 	}

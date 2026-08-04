@@ -5,12 +5,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"infinite-canvas/backend/internal/model"
 	"infinite-canvas/backend/internal/repository"
 
-	"gorm.io/driver/sqlite"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -38,6 +39,66 @@ func TestChannelFromRequestStoresConnectionWithoutDefaultProtocol(t *testing.T) 
 	}
 	if channel.APIKey != "access-key" || channel.SecretKey != "secret-key" {
 		t.Fatal("channel credentials were not stored")
+	}
+}
+
+func TestSystemChannelSecretsAreEncryptedAtRest(t *testing.T) {
+	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+
+	svc, db := newChannelModelTestService(t)
+	svc.dataDir = t.TempDir()
+	admin := &model.User{ID: "admin", Role: model.UserRoleAdmin}
+	useGlobal := true
+	created, err := svc.CreateSystemChannel(admin, ChannelRequest{
+		Name:                 "Secret channel",
+		BaseURL:              server.URL + "/v1",
+		APIKey:               "api-secret",
+		SecretKey:            "secondary-secret",
+		UseGlobalConcurrency: &useGlobal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stored model.ModelChannel
+	if err := db.First(&stored, "id = ?", created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.APIKey == "api-secret" || stored.SecretKey == "secondary-secret" || !strings.HasPrefix(stored.APIKey, encryptedSettingPrefix) || !strings.HasPrefix(stored.SecretKey, encryptedSettingPrefix) {
+		t.Fatalf("stored secrets are not encrypted: %#v", stored)
+	}
+	channel, err := svc.SystemChannel(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.APIKey != "api-secret" || channel.SecretKey != "secondary-secret" {
+		t.Fatalf("decrypted channel = %#v", channel)
+	}
+	modelEnabled := true
+	if _, err := svc.SaveAdminChannelModel(admin, created.ID, "", ChannelModelRequest{
+		ModelKey: "text-model", DisplayName: "Text model", Capability: "text",
+		Protocol: string(model.ChannelInterfaceChatCompletion), BillingMode: "fixed_request", Enabled: &modelEnabled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&stored, "id = ?", created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(stored.APIKey, encryptedSettingPrefix) || !strings.HasPrefix(stored.SecretKey, encryptedSettingPrefix) {
+		t.Fatalf("model save wrote plaintext secrets: %#v", stored)
+	}
+
+	enabled := true
+	if _, err := svc.UpdateSystemChannel(admin, created.ID, ChannelRequest{Name: "Secret channel v2", Enabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&stored, "id = ?", created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(stored.APIKey, encryptedSettingPrefix) || !strings.HasPrefix(stored.SecretKey, encryptedSettingPrefix) {
+		t.Fatalf("updated secrets are not encrypted: %#v", stored)
 	}
 }
 

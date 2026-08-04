@@ -721,6 +721,7 @@ type UserAnnouncementRead struct {
 type Task struct {
 	ID                string     `json:"id" gorm:"primaryKey;size:36"`
 	UserID            string     `json:"userId" gorm:"index;size:36;index:idx_tasks_user_created,priority:1"`
+	SubmissionID      string     `json:"submissionId,omitempty" gorm:"size:96"`
 	SessionID         string     `json:"sessionId" gorm:"index;size:36"`
 	ProjectID         string     `json:"projectId" gorm:"index;size:80"`
 	Type              string     `json:"type" gorm:"index;size:64"`
@@ -777,6 +778,19 @@ type TaskLog struct {
 	Message   string    `json:"message"`
 	Payload   string    `json:"payload" gorm:"type:text"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+// TaskTextChunk persists a bounded piece of a streaming text response. It is
+// intentionally separate from TaskLog so task-log cleanup never discards a
+// creator's partial draft.
+type TaskTextChunk struct {
+	ID        string    `json:"id" gorm:"primaryKey;size:36"`
+	UserID    string    `json:"userId" gorm:"index;size:36"`
+	TaskID    string    `json:"taskId" gorm:"index;size:36;uniqueIndex:idx_task_text_chunk_sequence,priority:1"`
+	Attempt   int       `json:"attempt" gorm:"uniqueIndex:idx_task_text_chunk_sequence,priority:2"`
+	Sequence  int64     `json:"sequence" gorm:"uniqueIndex:idx_task_text_chunk_sequence,priority:3"`
+	Delta     string    `json:"delta" gorm:"type:text"`
+	CreatedAt time.Time `json:"createdAt" gorm:"index"`
 }
 
 type SessionFile struct {

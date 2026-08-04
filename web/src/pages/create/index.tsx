@@ -10,16 +10,15 @@ import { ModelPicker } from "@/components/model-picker";
 import { canvasResourceMentionToken } from "@/lib/canvas/canvas-resource-references";
 import { generationErrorMessage } from "@/lib/generation-error";
 import { VIDEO_RESOLUTION_OPTIONS } from "@/lib/video-generation-options";
-import { parseBackendGenerationResult, runBackendGenerationTask, runBackendGenerationTaskBatch } from "@/services/api/generation-task";
-import { requestImageQuestion } from "@/services/api/image";
+import { isGenerationTaskSubmissionUncertain, parseBackendGenerationResult, submitBackendGenerationTask, submitBackendGenerationTaskBatch } from "@/services/api/generation-task";
 import { listAddedSkills, type Skill } from "@/services/api/skills";
-import { listGenerationTasks, queryGenerationTask, type GenerationTask } from "@/services/api/task-center";
+import { cancelGenerationTask, getTaskTextChunks, listGenerationTasks, queryGenerationTask, recoverGenerationTasks, taskTextEventsUrl, type GenerationTask, type TaskTextStream } from "@/services/api/task-center";
 import { modelDisplayName, modelOptionName, selectableModelsByCapability, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import type { ReferenceImage } from "@/types/image";
 import { buildCreationMentionReferences, creationReferenceMetadata, displayCreationPrompt, expandCreationPrompt, selectedCreationReferences, type CreationReference } from "./creation-references";
 
 type CreationMode = "text" | "image" | "video";
-type CreationStatus = "streaming" | "pending" | "done" | "error" | "cancelled";
+type CreationStatus = "streaming" | "pending" | "done" | "error" | "cancelled" | "draft";
 type CreationAttachment = ReferenceImage & { previewUrl: string };
 type CreationSettings = { ratio: string; seconds: string; quality: string; videoQuality: string; count: string };
 type CreationMessage = {
@@ -36,6 +35,9 @@ type CreationMessage = {
     references?: CreationReference[];
     settings?: CreationSettings;
     taskIds?: string[];
+    submissionIds?: string[];
+    textCursors?: Record<string, number>;
+    textAttempts?: Record<string, number>;
 };
 type CreationConversation = { id: string; title: string; updatedAt: string; messages: CreationMessage[] };
 
@@ -84,13 +86,14 @@ export default function CreatePage() {
     const [quality, setQuality] = useState("auto");
     const [videoQuality, setVideoQuality] = useState(config.vquality || "720");
     const [count, setCount] = useState(String(Math.max(1, Math.min(4, Number(config.count) || 1))));
-    const [busy, setBusy] = useState(false);
+    const [submitting, setSubmitting] = useState(false);
     const [historyOpen, setHistoryOpen] = useState(false);
-    const abortRef = useRef<AbortController | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const threadScrollRef = useRef<HTMLElement>(null);
     const followLatestMessageRef = useRef(true);
     const taskSyncWarningRef = useRef(false);
+    const conversationsRef = useRef<CreationConversation[]>([]);
+    const textEventSourcesRef = useRef<Map<string, EventSource>>(new Map());
 
     const activeConversation = useMemo(() => conversations.find((item) => item.id === activeId) || conversations[0], [activeId, conversations]);
     const historyConversations = useMemo(
@@ -100,37 +103,55 @@ export default function CreatePage() {
     const selectedModel = mode === "text" ? config.textModel : mode === "image" ? config.imageModel : config.videoModel;
     const mentionReferences = useMemo(() => buildCreationMentionReferences(addedSkills, attachments, draftReferences), [addedSkills, attachments, draftReferences]);
     const isEmpty = !activeConversation?.messages.length;
-    const pendingMediaKey = useMemo(() => pendingCreationMediaKey(conversations), [conversations]);
+    const pendingCreationKey = useMemo(() => pendingCreationTaskKey(conversations), [conversations]);
+    const activeTextTaskKey = useMemo(() => activeCreationTextTaskKey(activeConversation), [activeConversation]);
+    const busy = submitting || Boolean(activeConversation?.messages.some(isCreationInProgress));
+    conversationsRef.current = conversations;
 
     useEffect(() => {
         let cancelled = false;
         void localforage.getItem<CreationConversation[]>(STORAGE_KEY).then((stored) => {
             if (cancelled) return;
-            const next = stored?.length ? stored : [newConversation()];
+            const next = migrateCreationConversations(stored?.length ? stored : [newConversation()]);
             setConversations(next);
             setActiveId(next[0].id);
             setHydrated(true);
         });
         return () => {
             cancelled = true;
-            abortRef.current?.abort();
         };
     }, []);
 
     useEffect(() => {
-        if (hydrated) void localforage.setItem(STORAGE_KEY, conversations);
+        if (!hydrated) return;
+        const timer = window.setTimeout(() => void localforage.setItem(STORAGE_KEY, conversations), 300);
+        return () => window.clearTimeout(timer);
     }, [conversations, hydrated]);
 
     useEffect(() => {
-        if (!hydrated || !pendingMediaKey) return;
+        if (!hydrated || !pendingCreationKey) return;
         let cancelled = false;
         const syncTasks = async () => {
             try {
-                const summaries = await listGenerationTasks(100);
-                const tasks = await enrichCreationTaskSummaries(summaries);
+                const snapshot = conversationsRef.current;
+                const knownTaskIds = creationPendingTaskIds(snapshot);
+                const submissionIds = creationPendingSubmissionIds(snapshot);
+                const recovered = await recoverGenerationTasks(submissionIds);
+                const legacySummaries = hasLegacyPendingCreationMessage(snapshot) ? await listGenerationTasks(100) : [];
+                const summaryByID = new Map([...recovered, ...legacySummaries].map((task) => [task.id, task]));
+                const taskIds = Array.from(new Set([...knownTaskIds, ...summaryByID.keys()]));
+                const queried = await Promise.all(taskIds.map(async (taskID) => queryGenerationTask(taskID).catch(() => summaryByID.get(taskID))));
+                const tasks = queried.filter((task): task is GenerationTask => Boolean(task));
+                const streams = await Promise.all(tasks
+                    .filter((task) => task.type === "canvas_text")
+                    .map((task) => getTaskTextChunks(task.id, creationTextCursor(snapshot, task.id)).catch(() => null)));
                 if (cancelled) return;
                 taskSyncWarningRef.current = false;
-                setConversations((current) => reconcileCreationTaskMessages(current, tasks));
+                setConversations((current) => {
+                    const attached = attachRecoveredCreationTasks(current, [...tasks, ...recovered, ...legacySummaries]);
+                    const withText = mergeCreationTextStreams(attached, streams.filter((stream): stream is TaskTextStream => Boolean(stream)));
+                    return reconcileCreationTaskMessages(withText, tasks);
+                });
             } catch (error) {
                 if (cancelled) return;
                 console.warn("创作任务状态同步失败", error);
@@ -146,7 +167,36 @@ export default function CreatePage() {
             cancelled = true;
             window.clearInterval(timer);
         };
-    }, [hydrated, pendingMediaKey, toast]);
+    }, [hydrated, pendingCreationKey, toast]);
+
+    useEffect(() => {
+        const activeTasks = activeCreationTextTasks(activeConversation);
+        const wanted = new Set(activeTasks.map((task) => task.id));
+        for (const [taskID, source] of textEventSourcesRef.current) {
+            if (!wanted.has(taskID)) {
+                source.close();
+                textEventSourcesRef.current.delete(taskID);
+            }
+        }
+        for (const task of activeTasks) {
+            if (textEventSourcesRef.current.has(task.id)) continue;
+            const source = new EventSource(taskTextEventsUrl(task.id, task.cursor), { withCredentials: true });
+            source.addEventListener("delta", (event) => {
+                try {
+                    const payload = JSON.parse((event as MessageEvent<string>).data) as { attempt: number; sequence: number; delta: string };
+                    setConversations((current) => mergeCreationTextStreams(current, [{ task: task.task, attempt: payload.attempt, chunks: [{ sequence: payload.sequence, delta: payload.delta }], nextSequence: payload.sequence }]));
+                } catch {
+                    // The polling synchronizer is the reliable fallback for malformed SSE data.
+                }
+            });
+            textEventSourcesRef.current.set(task.id, source);
+        }
+    }, [activeTextTaskKey, activeConversation]);
+
+    useEffect(() => () => {
+        for (const source of textEventSourcesRef.current.values()) source.close();
+        textEventSourcesRef.current.clear();
+    }, []);
 
     useEffect(() => {
         let cancelled = false;
@@ -169,17 +219,16 @@ export default function CreatePage() {
         return () => window.cancelAnimationFrame(frame);
     }, [activeConversation?.id, activeConversation?.messages]);
 
-    const updateActive = useCallback((updater: (conversation: CreationConversation) => CreationConversation) => {
-        setConversations((current) => current.map((item) => item.id === activeId ? updater(item) : item));
-    }, [activeId]);
-
     const updateAssistant = useCallback((id: string, updater: (item: CreationMessage) => CreationMessage) => {
-        updateActive((conversation) => ({
-            ...conversation,
-            updatedAt: new Date().toISOString(),
-            messages: conversation.messages.map((item) => item.id === id ? updater(item) : item),
+        setConversations((current) => current.map((conversation) => {
+            if (!conversation.messages.some((item) => item.id === id)) return conversation;
+            return {
+                ...conversation,
+                updatedAt: new Date().toISOString(),
+                messages: conversation.messages.map((item) => item.id === id ? updater(item) : item),
+            };
         }));
-    }, [updateActive]);
+    }, []);
 
     const selectMode = (next: CreationMode) => {
         setMode(next);
@@ -210,94 +259,90 @@ export default function CreatePage() {
         if (reference) setPrompt((current) => removeReferenceTokens(current, [reference]));
     };
 
-    const submit = async () => {
-        const text = prompt.trim();
+    const submit = async (retry?: { source: CreationMessage; sourceIndex: number }) => {
+        const source = retry?.source;
+        const requestMode = source?.mode || mode;
+        const requestModel = source?.model || selectedModel;
+        const requestSettings = source?.settings || { ratio, seconds, quality, videoQuality, count };
+        const requestAttachments = source?.attachments || attachments;
+        const text = (source?.content || prompt).trim();
         if (!text || busy || !activeConversation) return;
-        if (!selectedModel) {
-            toast.warning(`请先在设置中配置${modeLabels[mode]}模型`);
+        if (!requestModel) {
+            toast.warning(`请先在设置中配置${modeLabels[requestMode]}模型`);
             return;
         }
-        const settings = { ratio, seconds, quality, videoQuality, count };
-        const references = selectedCreationReferences(text, mentionReferences);
-        const expandedPrompt = expandCreationPrompt(text, references, attachments);
+        const references = source?.references || selectedCreationReferences(text, mentionReferences);
+        const expandedPrompt = expandCreationPrompt(text, references, requestAttachments);
         const referenceMetadata = creationReferenceMetadata(references);
         followLatestMessageRef.current = true;
-        const userMessage = newMessage("user", text, { mode, model: selectedModel, attachments, references, settings });
-        const assistantMessage = newMessage("assistant", "", { mode, model: selectedModel, status: mode === "text" ? "streaming" : "pending", settings });
+        const userMessage = source || newMessage("user", text, { mode: requestMode, model: requestModel, attachments: requestAttachments, references, settings: requestSettings });
+        const taskCount = requestMode === "image" ? Math.max(1, Math.min(15, Math.floor(Number(requestSettings.count) || 1))) : 1;
+        const submissionIds = Array.from({ length: taskCount }, () => crypto.randomUUID());
+        const assistantMessage = newMessage("assistant", "", { mode: requestMode, model: requestModel, status: "pending", settings: requestSettings, submissionIds });
         const boundTaskIds = new Set<string>();
         const bindTask = (task: GenerationTask) => {
             if (boundTaskIds.has(task.id)) return;
             boundTaskIds.add(task.id);
             updateAssistant(assistantMessage.id, (item) => ({ ...item, taskIds: Array.from(new Set([...(item.taskIds || []), task.id])) }));
         };
-        updateActive((conversation) => ({
+        const nextConversations = conversations.map((conversation) => conversation.id === activeConversation.id ? {
             ...conversation,
             title: conversation.messages.length ? conversation.title : text.slice(0, 24),
             updatedAt: new Date().toISOString(),
-            messages: [...conversation.messages, userMessage, assistantMessage],
-        }));
-        setPrompt("");
-        setAttachments([]);
-        setDraftReferences([]);
-        setBusy(true);
-        const controller = new AbortController();
-        abortRef.current = controller;
-        const requestConfig = { ...config, model: selectedModel, imageModel: selectedModel, videoModel: selectedModel, textModel: selectedModel, size: ratio, videoSeconds: seconds, quality, vquality: videoQuality, count };
+            messages: source ? [...conversation.messages, assistantMessage] : [...conversation.messages, userMessage, assistantMessage],
+        } : conversation);
+        setConversations(nextConversations);
+        conversationsRef.current = nextConversations;
+        if (!source) {
+            setPrompt("");
+            setAttachments([]);
+            setDraftReferences([]);
+        }
+        setSubmitting(true);
+        const requestConfig = { ...config, model: requestModel, imageModel: requestModel, videoModel: requestModel, textModel: requestModel, size: requestSettings.ratio, videoSeconds: requestSettings.seconds, quality: requestSettings.quality, vquality: requestSettings.videoQuality, count: requestSettings.count };
         try {
-            if (mode === "text") {
-                const history = [...(activeConversation.messages || []), userMessage].map((item) => ({
-                    role: item.role,
-                    content: item.role === "user"
-                        ? buildTextMessageContent(item)
-                        : item.content,
-                }));
-                await requestImageQuestion(requestConfig, history, (delta) => updateAssistant(assistantMessage.id, (item) => ({ ...item, content: item.content + delta })), { signal: controller.signal });
-            } else if (mode === "image") {
-                const taskCount = Math.max(1, Math.min(15, Math.floor(Number(count) || 1)));
-                const settled = await runBackendGenerationTaskBatch({
+            await localforage.setItem(STORAGE_KEY, nextConversations);
+            if (requestMode === "text") {
+                await submitBackendGenerationTask({
+                    submissionId: submissionIds[0],
+                    mode: "text",
+                    prompt: creationTextTaskPrompt(retry ? activeConversation.messages.slice(0, retry.sourceIndex) : activeConversation.messages, userMessage),
+                    config: requestConfig,
+                    referenceImages: requestAttachments,
+                    metadata: { source: "create-page", conversationId: activeConversation.id, messageId: assistantMessage.id, submissionId: submissionIds[0], ...referenceMetadata },
+                    onTaskUpdate: bindTask,
+                });
+            } else if (requestMode === "image") {
+                await submitBackendGenerationTaskBatch({
                     mode: "image",
                     prompt: expandedPrompt,
                     config: { ...requestConfig, count: "1" },
-                    referenceImages: attachments,
-                    signal: controller.signal,
+                    referenceImages: requestAttachments,
+                    submissionIds,
                     metadata: { source: "create-page", conversationId: activeConversation.id, messageId: assistantMessage.id, ...referenceMetadata },
                     onTaskUpdate: bindTask,
                     count: taskCount,
                 });
-                if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
-                const resultUrls = settled.flatMap((entry) => entry.status === "fulfilled" ? (entry.value.images || []).map((image) => image.dataUrl).filter(Boolean) : []);
-                const failed = settled.filter((entry): entry is PromiseRejectedResult => entry.status === "rejected");
-                if (!resultUrls.length) {
-                    const reason = failed[0]?.reason;
-                    throw reason instanceof Error ? reason : new Error("后端任务没有返回图片");
-                }
-                if (failed.length) toast.warning(`${resultUrls.length} 张图片已生成，${failed.length} 张生成失败`);
-                updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "done", content: failed.length ? `${resultUrls.length} 张图片已生成，${failed.length} 张失败` : "图片已生成", resultUrls }));
             } else {
-                const result = await runBackendGenerationTask({
+                await submitBackendGenerationTask({
+                    submissionId: submissionIds[0],
                     mode: "video",
                     prompt: expandedPrompt,
                     config: requestConfig,
-                    referenceImages: attachments,
-                    signal: controller.signal,
-                    metadata: { source: "create-page", conversationId: activeConversation.id, messageId: assistantMessage.id, videoEditOperation: attachments.length ? "image_to_video" : "text_to_video", ...referenceMetadata },
+                    referenceImages: requestAttachments,
+                    metadata: { source: "create-page", conversationId: activeConversation.id, messageId: assistantMessage.id, submissionId: submissionIds[0], videoEditOperation: requestAttachments.length ? "image_to_video" : "text_to_video", ...referenceMetadata },
                     onTaskUpdate: bindTask,
                 });
-                if (!result.video?.dataUrl) throw new Error("后端任务没有返回视频");
-                const videoUrl = result.video.dataUrl;
-                updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "done", content: "视频已生成", resultUrls: [videoUrl] }));
             }
-            updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "done" }));
         } catch (error) {
-            if (controller.signal.aborted) {
-                updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "cancelled", content: "已停止" }));
+            if (isGenerationTaskSubmissionUncertain(error)) {
+                toast.info("未收到提交确认，正在恢复任务状态");
                 return;
             }
             const message = generationErrorMessage(error);
-            updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "error", error: message, content: "生成失败" }));
+            updateAssistant(assistantMessage.id, (item) => boundTaskIds.size ? item : ({ ...item, status: "error", error: message, content: item.content || "生成失败" }));
         } finally {
-            abortRef.current = null;
-            setBusy(false);
+            setSubmitting(false);
         }
     };
 
@@ -338,27 +383,32 @@ export default function CreatePage() {
     };
 
     const retryFailedMessage = (item: CreationMessage, index: number) => {
-        const previous = item.role === "assistant" ? activeConversation?.messages[index - 1] : item;
-        if (!previous?.content || busy) return;
+        const sourceIndex = item.role === "assistant" ? index - 1 : index;
+        const previous = activeConversation?.messages[sourceIndex];
+        if (!previous?.content || previous.role !== "user" || busy) return;
         followLatestMessageRef.current = true;
-        restoreMessageDraft(previous);
-        const removedIds = new Set([item.id, previous.id]);
-        updateActive((conversation) => {
-            const messages = conversation.messages.filter((message) => !removedIds.has(message.id));
-            const firstPrompt = messages.find((message) => message.role === "user")?.content.trim();
-            return {
-                ...conversation,
-                title: firstPrompt ? firstPrompt.slice(0, 24) : "新创作",
-                updatedAt: new Date().toISOString(),
-                messages,
-            };
-        });
+        void submit({ source: previous, sourceIndex });
     };
 
     const createVariant = (item: CreationMessage, index: number) => {
         const previous = item.role === "assistant" ? activeConversation?.messages[index - 1] : item;
         if (!previous?.content || busy) return;
         restoreMessageDraft(previous);
+    };
+
+    const stopActiveGeneration = async () => {
+        if (!activeConversation) return;
+        const taskIds = Array.from(new Set(activeConversation.messages
+            .filter(isCreationInProgress)
+            .flatMap((item) => item.taskIds || [])));
+        if (!taskIds.length) {
+            toast.info("任务正在提交，提交完成后可停止");
+            return;
+        }
+        const settled = await Promise.allSettled(taskIds.map((taskID) => cancelGenerationTask(taskID)));
+        const tasks = settled.flatMap((entry) => entry.status === "fulfilled" ? [entry.value] : []);
+        if (tasks.length) setConversations((current) => reconcileCreationTaskMessages(current, tasks));
+        if (tasks.length !== taskIds.length) toast.warning("部分任务暂时无法停止，请稍后重试");
     };
 
     if (!hydrated || !activeConversation) return <div className="grid h-full place-items-center"><Spin /></div>;
@@ -394,7 +444,7 @@ export default function CreatePage() {
         count,
         setCount,
         onSubmit: submit,
-        onStop: () => abortRef.current?.abort(),
+        onStop: () => void stopActiveGeneration(),
     };
 
     return <>
@@ -441,8 +491,10 @@ function CreationHistoryDrawer({ open, conversations, activeId, onClose, onSelec
 function CreationMessageView({ item, modelName, onRetryFailure, onCreateVariant }: { item: CreationMessage; modelName: string; onRetryFailure: () => void; onCreateVariant: () => void }) {
     if (item.role === "user") return <CreationUserMessage item={item} />;
     const mode = item.mode || "text";
-    const stateLabel = item.status === "pending" ? "生成中" : item.status === "cancelled" ? "已停止" : "";
-    return <article className="creation-assistant-message"><div className="creation-message-heading"><span className="creation-message-mark"><Sparkles /></span><span>{modeLabels[mode]}</span>{modelName ? <span className="creation-message-model">{modelName}</span> : null}{stateLabel ? <span className={`creation-message-state is-${item.status}`}>{stateLabel}</span> : null}</div>{mode === "text" ? <div className="creation-message-content">{item.content ? <ReactMarkdown>{item.content}</ReactMarkdown> : <span>正在生成…</span>}</div> : <MediaResult item={item} onRetryFailure={onRetryFailure} onCreateVariant={onCreateVariant} />}{item.error ? <div className="creation-message-error"><span>{generationErrorMessage(item.error)}</span><button type="button" onClick={onRetryFailure}><RefreshCw />重新生成</button></div> : null}</article>;
+    const stateLabel = isCreationInProgress(item) ? "生成中" : item.status === "cancelled" ? "已停止" : item.status === "draft" ? "未完成草稿" : "";
+    const emptyText = isCreationInProgress(item) ? "正在生成…" : item.status === "cancelled" ? "已停止" : item.status === "draft" ? "未完成草稿" : "暂无内容";
+    const retryable = item.status === "error" || item.status === "cancelled" || item.status === "draft";
+    return <article className="creation-assistant-message"><div className="creation-message-heading"><span className="creation-message-mark"><Sparkles /></span><span>{modeLabels[mode]}</span>{modelName ? <span className="creation-message-model">{modelName}</span> : null}{stateLabel ? <span className={`creation-message-state is-${item.status}`}>{stateLabel}</span> : null}</div>{mode === "text" ? <div className="creation-message-content">{item.content ? <ReactMarkdown>{item.content}</ReactMarkdown> : <span>{emptyText}</span>}</div> : <MediaResult item={item} onRetryFailure={onRetryFailure} onCreateVariant={onCreateVariant} />}{item.error ? <div className="creation-message-error"><span>{generationErrorMessage(item.error)}</span><button type="button" onClick={onRetryFailure}><RefreshCw />重新生成</button></div> : retryable ? <div className="creation-message-error"><button type="button" onClick={onRetryFailure}><RefreshCw />重新生成</button></div> : null}</article>;
 }
 
 function CreationUserMessage({ item }: { item: CreationMessage }) {
@@ -465,7 +517,7 @@ function MediaResult({ item, onRetryFailure, onCreateVariant }: { item: Creation
     const [previewType, setPreviewType] = useState<"image" | "video">("image");
     const resultUrls = item.resultUrls;
     const openPreview = (url: string, type: "image" | "video") => { setPreviewType(type); setPreviewUrl(url); };
-    if (item.status === "pending") return <div className="creation-media-pending"><Spin size="small" />正在生成{item.mode === "video" ? "视频" : "图片"}…</div>;
+    if (isCreationInProgress(item)) return <div className="creation-media-pending"><Spin size="small" />正在生成{item.mode === "video" ? "视频" : "图片"}…</div>;
     if ((item.status === "error" || item.status === "cancelled") && !resultUrls?.length) return null;
     if (!resultUrls?.length) return <div className="creation-media-empty">没有返回可预览结果 <button type="button" onClick={onRetryFailure}>重试</button></div>;
     return <div className="creation-media-result">{item.mode === "video" ? <button type="button" className="creation-video-result" onClick={() => openPreview(resultUrls[0], "video")} aria-label="预览生成视频"><video muted preload="metadata" className="size-full object-cover" src={resultUrls[0]} /><span><Maximize2 />预览视频</span></button> : <div className="creation-image-result-grid">{resultUrls.map((url) => <button key={url} type="button" className="creation-image-result" onClick={() => openPreview(url, "image")} aria-label="预览生成图片"><img src={url} alt="生成结果" /><span><Maximize2 /></span></button>)}</div>}<div className="creation-media-actions"><span>{item.mode === "video" ? "视频结果" : `${resultUrls.length} 张图片`}</span><button type="button" onClick={onCreateVariant}><RefreshCw />生成变体</button><Link to="/canvas">添加到画布</Link>{resultUrls.map((url, index) => <a key={`${url}-download`} href={url} download>{resultUrls.length > 1 ? `下载 ${index + 1}` : <><Download />下载</>}</a>)}</div><CreationMediaPreviewModal url={previewUrl} type={previewType} onClose={() => setPreviewUrl("")} /></div>;
@@ -603,26 +655,121 @@ function conversationPreviewMessage(conversation: CreationConversation) {
     return fallback;
 }
 
-function buildTextMessageContent(item: CreationMessage) {
-    const content = expandCreationPrompt(item.content, item.references || [], item.attachments || []);
-    const images = item.attachments || [];
-    if (!images.length) return content;
-    return [{ type: "text" as const, text: content }, ...images.map((image) => ({ type: "image_url" as const, image_url: { url: image.dataUrl || image.url || "" } }))];
-}
-
 function removeReferenceTokens(value: string, references: CreationReference[]) {
     return references.reduce((current, reference) => current.split(canvasResourceMentionToken(reference)).join(""), value);
 }
 
-function pendingCreationMediaKey(conversations: CreationConversation[]) {
-    return conversations.flatMap((conversation) => conversation.messages.flatMap((message) => message.role === "assistant" && message.status === "pending" && message.mode !== "text" ? [`${conversation.id}:${message.id}:${(message.taskIds || []).join(",")}`] : [])).join("|");
+function migrateCreationConversations(conversations: CreationConversation[]) {
+    return conversations.map((conversation) => ({
+        ...conversation,
+        messages: conversation.messages.map((message) => message.role === "assistant" && message.status === "streaming" && !(message.taskIds?.length || message.submissionIds?.length)
+            ? { ...message, status: "draft" as const }
+            : message),
+    }));
 }
 
-async function enrichCreationTaskSummaries(tasks: GenerationTask[]) {
-    return Promise.all(tasks.map(async (task) => {
-        if (!task.clientContext || (task.status !== "failed" && (task.status !== "succeeded" || task.previewUrl))) return task;
-        const detail = await queryGenerationTask(task.id).catch(() => null);
-        return detail ? { ...task, ...detail, clientContext: task.clientContext } : task;
+function isCreationInProgress(message: CreationMessage) {
+    return message.role === "assistant" && (message.status === "pending" || message.status === "streaming");
+}
+
+function pendingCreationTaskKey(conversations: CreationConversation[]) {
+    return conversations.flatMap((conversation) => conversation.messages.flatMap((message) => isCreationInProgress(message)
+        ? [`${conversation.id}:${message.id}:${(message.taskIds || []).join(",")}:${(message.submissionIds || []).join(",")}`]
+        : [])).join("|");
+}
+
+function creationPendingTaskIds(conversations: CreationConversation[]) {
+    return Array.from(new Set(conversations.flatMap((conversation) => conversation.messages.flatMap((message) => isCreationInProgress(message) ? (message.taskIds || []) : []))));
+}
+
+function creationPendingSubmissionIds(conversations: CreationConversation[]) {
+    return Array.from(new Set(conversations.flatMap((conversation) => conversation.messages.flatMap((message) => isCreationInProgress(message) ? (message.submissionIds || []) : []))));
+}
+
+function hasLegacyPendingCreationMessage(conversations: CreationConversation[]) {
+    return conversations.some((conversation) => conversation.messages.some((message) => isCreationInProgress(message) && !(message.taskIds?.length || message.submissionIds?.length)));
+}
+
+function activeCreationTextTaskKey(conversation?: CreationConversation) {
+    return activeCreationTextTasks(conversation).map((task) => task.id).join("|");
+}
+
+function activeCreationTextTasks(conversation?: CreationConversation) {
+    if (!conversation) return [] as Array<{ id: string; cursor: number; task: GenerationTask }>;
+    const result: Array<{ id: string; cursor: number; task: GenerationTask }> = [];
+    for (const message of conversation.messages) {
+        if (!isCreationInProgress(message) || message.mode !== "text") continue;
+        for (const id of message.taskIds || []) {
+            result.push({ id, cursor: message.textCursors?.[id] || 0, task: { id } as GenerationTask });
+        }
+    }
+    return result;
+}
+
+function creationTextCursor(conversations: CreationConversation[], taskID: string) {
+    for (const conversation of conversations) {
+        for (const message of conversation.messages) {
+            if (message.taskIds?.includes(taskID)) return message.textCursors?.[taskID] || 0;
+        }
+    }
+    return 0;
+}
+
+function attachRecoveredCreationTasks(conversations: CreationConversation[], tasks: GenerationTask[]) {
+    if (!tasks.length) return conversations;
+    return conversations.map((conversation) => ({
+        ...conversation,
+        messages: conversation.messages.map((message) => {
+            if (!isCreationInProgress(message)) return message;
+            const taskIDs = new Set(message.taskIds || []);
+            const submissionIDs = new Set(message.submissionIds || []);
+            for (const task of tasks) {
+                if (taskIDs.has(task.id) || submissionIDs.has(task.submissionId || "") || submissionIDs.has(task.clientContext?.submissionId || "") || (task.clientContext?.conversationId === conversation.id && task.clientContext.messageId === message.id)) {
+                    taskIDs.add(task.id);
+                }
+            }
+            const nextTaskIDs = Array.from(taskIDs);
+            return nextTaskIDs.length === (message.taskIds || []).length ? message : { ...message, taskIds: nextTaskIDs };
+        }),
+    }));
+}
+
+function mergeCreationTextStreams(conversations: CreationConversation[], streams: TaskTextStream[]) {
+    if (!streams.length) return conversations;
+    const byTaskID = new Map(streams.map((stream) => [stream.task.id, stream]));
+    return conversations.map((conversation) => ({
+        ...conversation,
+        messages: conversation.messages.map((message) => {
+            if (!isCreationInProgress(message) || message.mode !== "text") return message;
+            let content = message.content;
+            let changed = false;
+            const textCursors = { ...(message.textCursors || {}) };
+            const textAttempts = { ...(message.textAttempts || {}) };
+            for (const taskID of message.taskIds || []) {
+                const stream = byTaskID.get(taskID);
+                if (!stream) continue;
+                const previousAttempt = textAttempts[taskID];
+                if (previousAttempt !== undefined && stream.attempt > previousAttempt) {
+                    content = "";
+                    textCursors[taskID] = 0;
+                    changed = true;
+                }
+                if (previousAttempt !== undefined && stream.attempt < previousAttempt) continue;
+                textAttempts[taskID] = stream.attempt;
+                let cursor = textCursors[taskID] || 0;
+                for (const chunk of stream.chunks) {
+                    if (chunk.sequence <= cursor) continue;
+                    content += chunk.delta;
+                    cursor = chunk.sequence;
+                    changed = true;
+                }
+                if (cursor !== (textCursors[taskID] || 0)) {
+                    textCursors[taskID] = cursor;
+                    changed = true;
+                }
+            }
+            return changed ? { ...message, content, textCursors, textAttempts } : message;
+        }),
     }));
 }
 
@@ -632,33 +779,62 @@ function reconcileCreationTaskMessages(conversations: CreationConversation[], ta
         let conversationChanged = false;
         let completedAt = conversation.updatedAt;
         const messages = conversation.messages.map((message) => {
-            if (message.role !== "assistant" || message.status !== "pending" || message.mode === "text") return message;
+            if (!isCreationInProgress(message)) return message;
             const taskIds = new Set(message.taskIds || []);
+            const submissionIds = new Set(message.submissionIds || []);
             const matches = tasks
-                .filter((task) => taskIds.has(task.id) || (task.clientContext?.conversationId === conversation.id && task.clientContext.messageId === message.id))
+                .filter((task) => taskIds.has(task.id) || submissionIds.has(task.submissionId || "") || submissionIds.has(task.clientContext?.submissionId || "") || (task.clientContext?.conversationId === conversation.id && task.clientContext.messageId === message.id))
                 .sort((left, right) => (left.clientContext?.batchIndex || 0) - (right.clientContext?.batchIndex || 0));
-            const expectedTaskCount = Math.max(0, ...matches.map((task) => task.clientContext?.batchCount || 0));
-            if (!matches.length || (expectedTaskCount > 0 && matches.length < expectedTaskCount) || matches.some((task) => task.status === "queued" || task.status === "running")) return message;
-
-            const resultUrls = Array.from(new Set(matches.filter((task) => task.status === "succeeded").flatMap(creationTaskResultUrls)));
-            const succeededCount = matches.filter((task) => task.status === "succeeded").length;
-            const failedCount = matches.length - succeededCount;
+            const expectedTaskCount = Math.max(message.taskIds?.length || 0, message.submissionIds?.length || 0, ...matches.map((task) => task.clientContext?.batchCount || 0));
             const nextTaskIds = Array.from(new Set([...(message.taskIds || []), ...matches.map((task) => task.id)]));
+            if (!matches.length || (expectedTaskCount > 0 && matches.length < expectedTaskCount) || matches.some((task) => task.status === "queued" || task.status === "running")) {
+                return nextTaskIds.length === (message.taskIds || []).length ? message : { ...message, taskIds: nextTaskIds };
+            }
+
             completedAt = matches.reduce((latest, task) => conversationTimestamp(task.updatedAt) > conversationTimestamp(latest) ? task.updatedAt : latest, completedAt);
             conversationChanged = true;
             changed = true;
 
+            if (message.mode === "text") {
+                const succeeded = matches.find((task) => task.status === "succeeded");
+                if (succeeded) return { ...message, status: "done" as const, content: creationTaskText(succeeded) || message.content || "文本已生成", error: undefined, taskIds: nextTaskIds };
+                if (matches.every((task) => task.status === "cancelled")) return { ...message, status: "cancelled" as const, content: message.content, error: undefined, taskIds: nextTaskIds };
+                const failed = matches.find((task) => task.status === "failed");
+                return { ...message, status: "error" as const, content: message.content, error: generationErrorMessage(failed?.error || "任务已结束，但文本结果暂时无法读取"), taskIds: nextTaskIds };
+            }
+
+            const resultUrls = Array.from(new Set(matches.filter((task) => task.status === "succeeded").flatMap(creationTaskResultUrls)));
+            const succeededCount = matches.filter((task) => task.status === "succeeded").length;
+            const failedCount = matches.length - succeededCount;
             if (resultUrls.length) {
                 const content = message.mode === "video" ? "视频已生成" : failedCount ? `${resultUrls.length} 张图片已生成，${failedCount} 张失败` : "图片已生成";
                 return { ...message, status: "done" as const, content, resultUrls, error: undefined, taskIds: nextTaskIds };
             }
-            if (matches.every((task) => task.status === "cancelled")) return { ...message, status: "cancelled" as const, content: "已停止", error: undefined, taskIds: nextTaskIds };
+            if (matches.every((task) => task.status === "cancelled")) return { ...message, status: "cancelled" as const, content: message.content, error: undefined, taskIds: nextTaskIds };
             const failed = matches.find((task) => task.status === "failed");
-            return { ...message, status: "error" as const, content: "生成失败", error: generationErrorMessage(failed?.error || "任务已结束，但生成结果暂时无法读取"), taskIds: nextTaskIds };
+            return { ...message, status: "error" as const, content: message.content || "生成失败", error: generationErrorMessage(failed?.error || "任务已结束，但生成结果暂时无法读取"), taskIds: nextTaskIds };
         });
         return conversationChanged ? { ...conversation, messages, updatedAt: completedAt } : conversation;
     });
     return changed ? next : conversations;
+}
+
+function creationTaskText(task: GenerationTask) {
+    if (!task.resultJson) return "";
+    try {
+        return parseBackendGenerationResult(task).text || "";
+    } catch {
+        return "";
+    }
+}
+
+function creationTextTaskPrompt(history: CreationMessage[], current: CreationMessage) {
+    const turns = [...history, current].filter((message) => message.role === "user" || message.role === "assistant").slice(-12);
+    if (turns.length <= 1) return expandCreationPrompt(current.content, current.references || [], current.attachments || []);
+    return [
+        "请基于以下创作对话继续完成当前用户请求。",
+        ...turns.map((message) => `${message.role === "assistant" ? "助手" : "用户"}：${message.role === "user" ? expandCreationPrompt(message.content, message.references || [], message.attachments || []) : message.content}`),
+    ].join("\n\n");
 }
 
 function creationTaskResultUrls(task: GenerationTask) {

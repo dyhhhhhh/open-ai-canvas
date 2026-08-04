@@ -1,0 +1,23 @@
+[Unit]
+Description=Open AI Canvas backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openai-canvas
+Group=openai-canvas
+WorkingDirectory=/opt/open-ai-canvas
+EnvironmentFile=/etc/open-ai-canvas/open-ai-canvas.env
+ExecStart=/opt/open-ai-canvas/bin/open-ai-canvas-backend
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/mnt/sdc/open-ai-canvas
+
+[Install]
+WantedBy=multi-user.target

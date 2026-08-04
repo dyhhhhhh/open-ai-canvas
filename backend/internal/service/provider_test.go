@@ -93,6 +93,13 @@ func TestVolcengineArkImageBodyUsesJSONReferencesAndDownscalesSize(t *testing.T)
 	}
 }
 
+func TestNormalizeVolcengineArkImageSizeUpscalesToProviderMinimum(t *testing.T) {
+	size := normalizeVolcengineArkImageSize("1024x1024")
+	if size != "1920x1920" {
+		t.Fatalf("normalized size = %q, want 1920x1920", size)
+	}
+}
+
 func TestVolcengineArkImageRejectsMaskBeforeRequest(t *testing.T) {
 	_, err := runImageTask(context.Background(), canvasGenerationInput{
 		Prompt: "edit only the masked area",
@@ -799,7 +806,7 @@ func TestRunNewAPIChannel2VideoTaskDownloadsTemporaryResult(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode request: %v", err)
 			}
-			if body["model"] != "grok-image-video" || body["seconds"] != "10" || body["aspect_ratio"] != "9:16" || body["resolution"] != "720p" {
+			if body["model"] != "grok-image-video" || body["seconds"] != "15" || body["aspect_ratio"] != "9:16" || body["resolution"] != "720p" {
 				t.Errorf("body = %#v", body)
 			}
 			images, ok := body["image_urls"].([]interface{})

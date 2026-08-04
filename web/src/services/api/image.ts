@@ -122,6 +122,7 @@ const IMAGE_MAX_PIXELS = 8294400;
 const IMAGE_MAX_EDGE = 3840;
 const IMAGE_MAX_RATIO = 3;
 const IMAGE_OUTPUT_FORMAT = "png";
+const VOLCENGINE_ARK_IMAGE_MIN_PIXELS = 3686400;
 const VOLCENGINE_ARK_IMAGE_MAX_PIXELS = 4624220;
 
 function normalizeQuality(quality: string) {
@@ -195,10 +196,18 @@ function resolveRequestSize(quality: string | undefined, size: string) {
 function normalizeVolcengineArkImageSize(size: string | undefined) {
     if (!size) return undefined;
     const dimensions = parseImageDimensions(size);
-    if (!dimensions || dimensions.width * dimensions.height <= VOLCENGINE_ARK_IMAGE_MAX_PIXELS) return size;
-    const scale = Math.sqrt(VOLCENGINE_ARK_IMAGE_MAX_PIXELS / (dimensions.width * dimensions.height));
-    let width = Math.floor((dimensions.width * scale) / 2) * 2;
-    let height = Math.floor((dimensions.height * scale) / 2) * 2;
+    if (!dimensions) return size;
+    const pixels = dimensions.width * dimensions.height;
+    if (pixels >= VOLCENGINE_ARK_IMAGE_MIN_PIXELS && pixels <= VOLCENGINE_ARK_IMAGE_MAX_PIXELS) return size;
+    const targetPixels = pixels < VOLCENGINE_ARK_IMAGE_MIN_PIXELS ? VOLCENGINE_ARK_IMAGE_MIN_PIXELS : VOLCENGINE_ARK_IMAGE_MAX_PIXELS;
+    const round = pixels < VOLCENGINE_ARK_IMAGE_MIN_PIXELS ? Math.ceil : Math.floor;
+    const scale = Math.sqrt(targetPixels / pixels);
+    let width = round((dimensions.width * scale) / 2) * 2;
+    let height = round((dimensions.height * scale) / 2) * 2;
+    while (width > 2 && height > 2 && width * height < VOLCENGINE_ARK_IMAGE_MIN_PIXELS) {
+        if (width >= height) width += 2;
+        else height += 2;
+    }
     while (width > 2 && height > 2 && width * height > VOLCENGINE_ARK_IMAGE_MAX_PIXELS) {
         if (width >= height) width -= 2;
         else height -= 2;

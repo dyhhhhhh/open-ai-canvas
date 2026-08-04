@@ -1,7 +1,7 @@
 import { getMediaBlob } from "@/services/file-storage";
 import { getImageBlob } from "@/services/image-storage";
 import { resourceIdFromStorageKey, resourceStorageKey, uploadResourceFile } from "@/services/api/resources";
-import { createGenerationTask, waitForGenerationTask, type GenerationTask } from "@/services/api/task-center";
+import { createGenerationTask, isTaskRequestTransportUncertain, recoverGenerationTasks, waitForGenerationTask, type GenerationTask } from "@/services/api/task-center";
 import { resolveModelRequestConfig, type AiConfig } from "@/stores/use-config-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -16,7 +16,22 @@ export type BackendGenerationResult = {
     text?: string;
 };
 
+export class GenerationTaskSubmissionUncertainError extends Error {
+    readonly submissionId: string;
+
+    constructor(submissionId: string, cause: unknown) {
+        super("生成请求尚未确认，正在恢复任务状态", { cause });
+        this.name = "GenerationTaskSubmissionUncertainError";
+        this.submissionId = submissionId;
+    }
+}
+
+export function isGenerationTaskSubmissionUncertain(error: unknown): error is GenerationTaskSubmissionUncertainError {
+    return error instanceof GenerationTaskSubmissionUncertainError;
+}
+
 type BackendGenerationTaskOptions = {
+	submissionId?: string;
     projectId?: string;
     mode: BackendGenerationMode;
     prompt: string;
@@ -39,6 +54,7 @@ type PreparedGenerationReferences = {
 
 // 生成、计费、取消和任务记录必须共用后端任务生命周期，页面层不能再直连供应商。
 export async function runBackendGenerationTask({
+	submissionId,
     projectId,
     mode,
     prompt,
@@ -54,7 +70,7 @@ export async function runBackendGenerationTask({
     throwIfAborted(signal);
     const prepared = await prepareGenerationReferences({ referenceImages, referenceVideos, referenceAudios, mask });
     throwIfAborted(signal);
-    return createAndWaitGenerationTask({ projectId, mode, prompt, config, referenceImages, referenceVideos, signal, metadata, onTaskUpdate }, prepared);
+    return createAndWaitGenerationTask({ submissionId, projectId, mode, prompt, config, referenceImages, referenceVideos, signal, metadata, onTaskUpdate }, prepared);
 }
 
 export async function runBackendGenerationTaskBatch(options: BackendGenerationTaskOptions & { count: number }) {
@@ -80,10 +96,52 @@ async function prepareGenerationReferences({ referenceImages = [], referenceVide
     return { referenceImages: preparedImages, referenceVideos: preparedVideos, referenceAudios: preparedAudios, mask: preparedMask };
 }
 
-async function createAndWaitGenerationTask({ projectId, mode, prompt, config, referenceImages = [], signal, metadata, onTaskUpdate }: BackendGenerationTaskOptions, prepared: PreparedGenerationReferences) {
-    const videoOperation = String(metadata?.videoEditOperation || (referenceImages.length ? "image_to_video" : "text_to_video"));
-    const task = await createGenerationTask({
-        ...(projectId ? { projectId } : {}),
+async function createAndWaitGenerationTask({ submissionId, projectId, mode, prompt, config, referenceImages = [], signal, metadata, onTaskUpdate }: BackendGenerationTaskOptions, prepared: PreparedGenerationReferences) {
+	const task = await createBackendGenerationTask({ submissionId, projectId, mode, prompt, config, referenceImages, metadata, onTaskUpdate }, prepared);
+	const completed = await waitForGenerationTask(task.id, { signal, initialTask: task, onTaskUpdate });
+	return parseBackendGenerationResult(completed);
+}
+
+// Submitting a task is intentionally separate from waiting for it. Pages that
+// persist conversation state must not bind a server task to their own lifetime.
+export async function submitBackendGenerationTask({
+	submissionId,
+	projectId,
+	mode,
+	prompt,
+	config,
+	referenceImages = [],
+	referenceVideos = [],
+	referenceAudios = [],
+	mask,
+	signal,
+	metadata,
+	onTaskUpdate,
+}: BackendGenerationTaskOptions) {
+	throwIfAborted(signal);
+	const prepared = await prepareGenerationReferences({ referenceImages, referenceVideos, referenceAudios, mask });
+	throwIfAborted(signal);
+	return createBackendGenerationTask({ submissionId, projectId, mode, prompt, config, referenceImages, metadata, onTaskUpdate }, prepared);
+}
+
+export async function submitBackendGenerationTaskBatch(options: BackendGenerationTaskOptions & { count: number; submissionIds?: string[] }) {
+	const count = Math.max(1, Math.min(15, Math.floor(Number(options.count)) || 1));
+	throwIfAborted(options.signal);
+	const prepared = await prepareGenerationReferences(options);
+	throwIfAborted(options.signal);
+	return Promise.all(Array.from({ length: count }, (_, batchIndex) => createBackendGenerationTask({
+		...options,
+		submissionId: options.submissionIds?.[batchIndex] || options.submissionId,
+		metadata: { ...options.metadata, batchIndex, batchCount: count },
+	}, prepared)));
+}
+
+async function createBackendGenerationTask({ submissionId, projectId, mode, prompt, config, referenceImages = [], metadata, onTaskUpdate }: BackendGenerationTaskOptions, prepared: PreparedGenerationReferences) {
+	const videoOperation = String(metadata?.videoEditOperation || (referenceImages.length ? "image_to_video" : "text_to_video"));
+	try {
+		const task = await createGenerationTask({
+			...(submissionId ? { submissionId } : {}),
+			...(projectId ? { projectId } : {}),
         type: `canvas_${mode}`,
         operation: mode === "video" ? videoOperation : mode,
         prompt,
@@ -96,12 +154,20 @@ async function createAndWaitGenerationTask({ projectId, mode, prompt, config, re
             referenceVideos: prepared.referenceVideos,
             referenceAudios: prepared.referenceAudios,
             mask: prepared.mask,
-            metadata,
-        },
-    });
-    onTaskUpdate?.(task);
-    const completed = await waitForGenerationTask(task.id, { signal, initialTask: task, onTaskUpdate });
-    return parseBackendGenerationResult(completed);
+			metadata: { ...metadata, ...(submissionId ? { submissionId } : {}) },
+		},
+		});
+		onTaskUpdate?.(task);
+		return task;
+	} catch (error) {
+		if (!submissionId || !isTaskRequestTransportUncertain(error)) throw error;
+		const recovered = await recoverGenerationTasks([submissionId]).catch(() => [] as GenerationTask[]);
+		if (recovered[0]) {
+			onTaskUpdate?.(recovered[0]);
+			return recovered[0];
+		}
+		throw new GenerationTaskSubmissionUncertainError(submissionId, error);
+	}
 }
 
 async function prepareBackendMediaReference(media: ReferenceVideo | ReferenceAudio) {

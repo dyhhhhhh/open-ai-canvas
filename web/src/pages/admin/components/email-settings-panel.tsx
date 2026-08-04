@@ -26,13 +26,18 @@ export default function EmailSettingsPanel() {
 
     const save = async () => {
         const values = await form.validateFields();
+        const port = Number(values.port);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+            message.error("SMTP 端口应为 1 到 65535 的整数");
+            return;
+        }
         if (values.enabled && values.username?.trim() && !values.password?.trim() && !setting?.hasPassword) {
             message.error("启用 SMTP 登录前请填写密码");
             return;
         }
         setSaving(true);
         try {
-            const result = await updateAdminEmailSetting({ ...values, password: values.password?.trim() || "" });
+            const result = await updateAdminEmailSetting({ ...values, port, password: values.password?.trim() || "" });
             setSetting(result.setting);
             form.setFieldsValue({ ...result.setting, password: "" });
             message.success("注册邮件配置已保存");

@@ -7,7 +7,7 @@ import (
 	"infinite-canvas/backend/internal/model"
 	"infinite-canvas/backend/internal/repository"
 
-	"gorm.io/driver/sqlite"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -16,7 +16,7 @@ func TestNormalizeTaskInputMakesTypedProviderConfigBillable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&model.ChannelModel{}); err != nil {
+	if err := db.AutoMigrate(&model.ChannelModel{}, &model.SystemSetting{}); err != nil {
 		t.Fatal(err)
 	}
 	channelModel := model.ChannelModel{
