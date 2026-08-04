@@ -24,6 +24,7 @@ import { CanvasNodeType, type CanvasAssistantMessage, type CanvasAssistantPendin
 import { useCanvasAgentStore } from "@/stores/canvas/use-canvas-agent-store";
 import { previewCanvasAgentOps, summarizeCanvasAgentOps, type CanvasAgentOp, type CanvasAgentOperationImpact, type CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { canvasAgentPromptCacheKey } from "@/lib/openai-prompt-cache";
+import { resolveStoryboardGenerationContext } from "@/lib/canvas/canvas-storyboard-context";
 
 export const CANVAS_AGENT_PANEL_MOTION_MS = 500;
 const PANEL_MOTION_SECONDS = CANVAS_AGENT_PANEL_MOTION_MS / 1000;
@@ -316,6 +317,7 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, snapshot, project
 
     const runCinematicSession = async (sessionId: string, text: string, current: CanvasAgentSnapshot, config: AiConfig, onCreated?: (backendSessionId: string) => void) => {
         const requestConfig = resolveModelRequestConfig(config, config.textModel || config.model);
+        const storyboardContext = resolveStoryboardGenerationContext(current.nodes);
         const controller = new AbortController();
         const requestKey = `creating:${nanoid()}`;
         let backendSessionId = "";
@@ -326,6 +328,8 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, snapshot, project
                     projectId,
                     prompt: text,
                     canvasSnapshot: compactSnapshot(current) as unknown as Record<string, unknown>,
+                    projectStyle: storyboardContext.projectStyle,
+                    characters: storyboardContext.characters,
                     config: backendAgentProviderConfig(requestConfig),
                 },
                 {
@@ -795,7 +799,7 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, snapshot, project
                         left={
                             <>
                                 <AgentTextModelPicker config={effectiveConfig} value={effectiveConfig.textModel} onChange={(model) => updateConfig("textModel", model)} />
-                                {cinematicEntryActive ? <span className="ml-2 inline-flex h-6 items-center rounded-md px-2 text-[10px] font-medium" style={{ background: theme.spatial.surface, color: theme.node.muted }}>影视项目</span> : null}
+                                {cinematicEntryActive ? <span className="ml-2 inline-flex h-6 items-center rounded-md px-2 text-[var(--fs-tiny)] font-medium" style={{ background: theme.spatial.surface, color: theme.node.muted }}>影视项目</span> : null}
                             </>
                         }
                     />
@@ -952,13 +956,13 @@ function AssistantHistory({
                     <div className="flex items-center gap-2">
                         <div className="min-w-0 flex-1">
                             <div className="flex min-w-0 items-center gap-1.5">
-                                {session.id === activeSession?.id ? <span className="shrink-0 text-[10px] font-medium" style={{ color: theme.node.text }}>当前</span> : null}
+                                {session.id === activeSession?.id ? <span className="shrink-0 text-[var(--fs-tiny)] font-medium" style={{ color: theme.node.text }}>当前</span> : null}
                                 <div className="truncate text-sm font-medium leading-5">{session.title}</div>
                             </div>
-                            <div className="truncate text-[11px] leading-4 opacity-65">{sessionPreview(session)}</div>
+                            <div className="truncate text-[var(--fs-label)] leading-4 opacity-65">{sessionPreview(session)}</div>
                         </div>
                         <div className="flex shrink-0 items-center gap-1">
-                            <span className="text-[10px] opacity-55">{formatSessionTime(session.updatedAt || session.createdAt)}</span>
+                            <span className="text-[var(--fs-tiny)] opacity-55">{formatSessionTime(session.updatedAt || session.createdAt)}</span>
                             <Button size="small" className="!h-6 !px-2" onClick={() => onOpen(session.id)}>
                                 进入
                             </Button>
@@ -1057,7 +1061,7 @@ function AssistantReferenceChip({ item, label, onRemove }: { item: CanvasAssista
             {item.dataUrl ? (
                 <span className="relative block size-8 shrink-0">
                     <img src={item.dataUrl} alt="" className="size-8 rounded-lg object-cover" />
-                    {label ? <span className="absolute left-0.5 top-0.5 rounded bg-black/60 px-1 py-0.5 text-[8px] font-medium leading-none text-white">{label}</span> : null}
+                    {label ? <span className="absolute left-0.5 top-0.5 rounded bg-black/60 px-1 py-0.5 text-[var(--fs-micro)] font-medium leading-none text-white">{label}</span> : null}
                 </span>
             ) : (
                 <span className="grid size-8 place-items-center rounded-md text-sm font-medium" style={{ background: theme.spatial.surface }}>
@@ -1549,6 +1553,9 @@ function compactMetadata(metadata: CanvasNodeData["metadata"]) {
         workflowKind: metadata?.workflowKind,
         workflowTitle: metadata?.workflowTitle,
         workflowDescription: metadata?.workflowDescription,
+        characterName: metadata?.characterName,
+        characterAssetId: metadata?.characterAssetId,
+        characterVersionId: metadata?.characterVersionId,
         chapterId: metadata?.chapterId,
         chapterTitle: metadata?.chapterTitle,
         shotIndex: metadata?.shotIndex,

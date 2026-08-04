@@ -155,7 +155,13 @@ func (s *Service) processCanvasGenerationTask(ctx context.Context, userID string
 	case "image":
 		return runImageTask(ctx, input)
 	case "text":
-		return runTextTask(ctx, input)
+		result, taskErr := runTextTask(ctx, input)
+		if taskErr == nil {
+			if operation := metadataString(input.Metadata, "promptTemplateOperation"); operation != "" {
+				taskErr = validatePromptTemplateResult(operation, result)
+			}
+		}
+		return result, taskErr
 	case "video":
 		return runVideoTask(ctx, input)
 	case "audio":
@@ -204,6 +210,11 @@ func (s *Service) processCanvasTextGenerationTask(ctx context.Context, task mode
 	if flushErr != nil {
 		return nil, flushErr
 	}
+	if operation := metadataString(input.Metadata, "promptTemplateOperation"); operation != "" {
+		if err := validatePromptTemplateResult(operation, result); err != nil {
+			return result, err
+		}
+	}
 	return result, nil
 }
 
@@ -214,6 +225,15 @@ func (s *Service) canvasGenerationInput(ctx context.Context, userID string, task
 	}
 	if strings.TrimSpace(input.Prompt) == "" {
 		input.Prompt = fallbackPrompt
+	}
+	promptTemplateOperation := metadataString(input.Metadata, "promptTemplateOperation")
+	if promptTemplateOperation != "" {
+		values := metadataStringValues(input.Metadata["promptTemplateVariables"])
+		compiled, compileErr := s.compilePrompt(userID, promptTemplateOperation, values)
+		if compileErr != nil {
+			return nil, fmt.Errorf("编译用户提示词失败：%w", compileErr)
+		}
+		input.Prompt = compiled.Content
 	}
 	if strings.TrimSpace(input.Prompt) == "" {
 		return canvasGenerationInput{}, errors.New("prompt is required")
@@ -245,6 +265,18 @@ func (s *Service) canvasGenerationInput(ctx context.Context, userID string, task
 		}
 	}
 	return input, nil
+}
+
+func metadataStringValues(value any) map[string]string {
+	values := map[string]string{}
+	raw, ok := value.(map[string]interface{})
+	if !ok {
+		return values
+	}
+	for key, item := range raw {
+		values[key] = strings.TrimSpace(fmt.Sprint(item))
+	}
+	return values
 }
 
 func (s *Service) hydrateGenerationMedia(userID string, input *canvasGenerationInput, requirePublicURL bool) error {

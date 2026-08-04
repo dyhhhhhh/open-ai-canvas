@@ -8,6 +8,7 @@ import ChannelsPage from "@/pages/admin/channels/channels-page";
 import LogsPage from "@/pages/admin/logs/logs-page";
 import RedemptionCodesPage from "@/pages/admin/redemption-codes/redemption-codes-page";
 import RuntimePolicySettingsPage from "@/pages/admin/settings/runtime-policy-settings-page";
+import DrawingEngineSettingsPage from "@/pages/admin/settings/drawing-engine-settings-page";
 import StorageSettingsPage from "@/pages/admin/settings/storage-settings-page";
 import StoryboardPromptsPage from "@/pages/admin/storyboard-prompts/storyboard-prompts-page";
 import UsersPage from "@/pages/admin/users/users-page";
@@ -68,12 +69,14 @@ export const router = createBrowserRouter([
                     { index: true, element: <AnalyticsPage /> },
                     { path: "users", element: <UsersPage /> },
                     { path: "channels", element: <ChannelsPage /> },
-                    { path: "storyboard-prompts", element: <StoryboardPromptsPage /> },
+                    { path: "prompt-templates", element: <StoryboardPromptsPage /> },
+                    { path: "storyboard-prompts", element: <Navigate to="/admin/prompt-templates" replace /> },
                     { path: "announcements", element: <AnnouncementsPage /> },
                     { path: "credit-operations", element: <CreditOperationsPage /> },
                     { path: "redemption-codes", element: <RedemptionCodesPage /> },
                     { path: "logs", element: <LogsPage /> },
                     { path: "settings", element: <Navigate to="runtime-policy" replace /> },
+                    { path: "settings/drawing-engine", element: <DrawingEngineSettingsPage /> },
                     { path: "settings/concurrency", element: <Navigate to="/admin/settings/runtime-policy" replace /> },
                     { path: "settings/runtime-policy", element: <RuntimePolicySettingsPage /> },
                     { path: "settings/access", element: <AccessSettingsPage /> },
