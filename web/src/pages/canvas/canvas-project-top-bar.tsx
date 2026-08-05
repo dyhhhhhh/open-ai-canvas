@@ -1,7 +1,7 @@
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { Link } from "react-router";
-import { Bot, Check, ChevronDown, Coins, FolderKanban, Gauge, Home, LayoutGrid, LoaderCircle, Menu, Pencil, Plus, Redo2, Search, Settings2, Share2, Sparkles, Trash2, Undo2, Upload } from "lucide-react";
+import { Bot, Check, ChevronDown, Coins, FolderKanban, Gauge, Home, LayoutGrid, LoaderCircle, Menu, Pencil, PanelRightClose, PanelRightOpen, Plus, Redo2, Search, Settings2, Share2, Sparkles, Trash2, Undo2, Upload } from "lucide-react";
 import { Button, Dropdown, Modal, Tooltip } from "antd";
 
 import { useWalletBalance } from "@/hooks/use-wallet-balance";
@@ -38,6 +38,9 @@ type CanvasTopBarProps = {
     onMediaPerformanceModeChange: (mode: CanvasMediaPerformanceMode) => void;
     onOpenSearch: () => void;
     projectContext?: CanvasContextSummary & { projectId: string; projectName: string };
+    focusMode: boolean;
+    focusModeForced: boolean;
+    onToggleFocusMode: () => void;
 };
 
 export function CanvasTopBar({
@@ -66,10 +69,14 @@ export function CanvasTopBar({
     onMediaPerformanceModeChange,
     onOpenSearch,
     projectContext,
+    focusMode,
+    focusModeForced,
+    onToggleFocusMode,
 }: CanvasTopBarProps) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const user = useUserStore((state) => state.user);
-    const { availableMicrocredits, refreshing } = useWalletBalance(user?.id);
+    const creditsEnabled = useUserStore((state) => state.features.creditsEnabled);
+    const { availableMicrocredits, refreshing } = useWalletBalance(user?.id, creditsEnabled);
     const titleRef = useRef<HTMLDivElement>(null);
     const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
@@ -88,7 +95,7 @@ export function CanvasTopBar({
 
     return (
         <>
-            <div className="pointer-events-none absolute left-0 right-0 top-0 z-50 flex h-16 items-center justify-between px-4">
+            <div className="pointer-events-none absolute left-0 right-0 top-0 z-[var(--z-toolbar)] flex h-[var(--canvas-topbar-h)] items-center justify-between px-[var(--canvas-inset-x)]">
                 <div className="pointer-events-auto flex min-w-0 items-center gap-3">
                     <Dropdown
                         trigger={["click"]}
@@ -188,7 +195,7 @@ export function CanvasTopBar({
                         <Button type="text" className="!hidden !h-10 !w-10 !min-w-10 !rounded-xl !p-0 lg:!inline-flex" style={{ color: theme.node.text }} icon={<Gauge className="size-4" />} aria-label="媒体性能模式" title="媒体性能模式" />
                     </Dropdown>
                     {compactAgentStatus ? <CompactAgentStatus status={compactAgentStatus} onClick={onToggleAgent} /> : null}
-                    {user ? (
+                    {user && creditsEnabled ? (
                         <Link
                             to="/wallet"
                             className="inline-flex h-9 min-w-[5.5rem] items-center justify-center gap-1.5 rounded-lg px-2.5 text-xs font-medium tabular-nums transition hover:bg-black/5 dark:hover:bg-white/10"
@@ -199,6 +206,22 @@ export function CanvasTopBar({
                             <span>{availableMicrocredits === null ? "--" : (availableMicrocredits / 1_000_000).toLocaleString("zh-CN", { maximumFractionDigits: 3 })}</span>
                         </Link>
                     ) : null}
+                    <Tooltip title={focusModeForced ? "小屏强制避让模式" : focusMode ? "专注模式：已避让（点击切换浮层）" : "专注模式：已浮层（点击切换避让）"}>
+                        <Button
+                            type="text"
+                            className="!h-10 !w-10 !min-w-10 !rounded-xl !p-0"
+                            style={{
+                                color: theme.node.text,
+                                opacity: focusModeForced ? 0.45 : 1,
+                                background: focusMode ? theme.toolbar.panel : undefined,
+                            }}
+                            icon={focusMode ? <PanelRightClose className="size-4" /> : <PanelRightOpen className="size-4" />}
+                            onClick={onToggleFocusMode}
+                            disabled={focusModeForced}
+                            aria-pressed={focusMode}
+                            aria-label="专注模式：画布与侧面板避让/浮层切换"
+                        />
+                    </Tooltip>
                     <Button type="text" className="!h-10 !w-10 !min-w-10 !rounded-xl !p-0" style={{ color: theme.node.text }} icon={<Share2 className="size-4" />} onClick={onShare} aria-label="分享画布" title="分享画布" />
                     <span className="h-6 w-px" style={{ background: theme.toolbar.border }} />
                     <Button
@@ -268,7 +291,7 @@ function CanvasWorkspaceModeSwitch({ mode, onChange }: { mode: CanvasWorkspaceMo
     };
 
     return (
-        <div ref={rootRef} className="aceternity-mode-switch pointer-events-auto absolute left-1/2 top-2 z-30 -translate-x-1/2">
+        <div ref={rootRef} className="aceternity-mode-switch pointer-events-auto absolute left-1/2 top-2 z-[var(--dock-z-popover)] -translate-x-1/2">
             <motion.button
                 type="button"
                 whileHover={reducedMotion ? undefined : { y: -1, scale: 1.015 }}

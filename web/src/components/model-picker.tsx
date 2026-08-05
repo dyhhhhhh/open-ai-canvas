@@ -6,6 +6,7 @@ import { canvasThemes } from "@/lib/canvas-theme";
 import { cn } from "@/lib/utils";
 import { modelDisplayName, modelOptionLabel, modelOptionName, resolveModelChannel, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
+import { useUserStore } from "@/stores/use-user-store";
 
 type ModelPickerProps = {
     config: AiConfig;
@@ -21,6 +22,7 @@ type ModelPickerProps = {
 };
 
 export function ModelPicker({ config, value, onChange, capability, className, fullWidth = false, placeholder = "选择模型", onMissingConfig, showSelectedPrice = true, variant = "default" }: ModelPickerProps) {
+    const creditsEnabled = useUserStore((state) => state.features.creditsEnabled);
     const pickerId = useId();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const [open, setOpen] = useState(false);
@@ -59,6 +61,19 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
         window.addEventListener("model-picker-open", closeOtherPicker);
         return () => window.removeEventListener("model-picker-open", closeOtherPicker);
     }, [pickerId]);
+
+    useEffect(() => {
+        if (!open) return;
+        // 画布拖拽从 pointerdown 开始，须在捕获阶段关闭 Portal 菜单，避免菜单与触发器分离。
+        const closeOnOutsidePointer = (event: PointerEvent) => {
+            const target = event.target;
+            if (!(target instanceof Node)) return;
+            if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+            setOpen(false);
+        };
+        window.addEventListener("pointerdown", closeOnOutsidePointer, true);
+        return () => window.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+    }, [open]);
 
     const setPickerOpen = (nextOpen: boolean) => {
         if (nextOpen && !options.length && config.channelMode === "local") onMissingConfig?.();
@@ -129,7 +144,7 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
                                         window.requestAnimationFrame(() => triggerRef.current?.focus());
                                     }}
                                 >
-                                    <ModelLabel config={config} model={model} capability={capability} theme={theme} creationVariant={creationVariant} />
+                                    <ModelLabel config={config} model={model} capability={capability} theme={theme} creationVariant={creationVariant} showPrice={creditsEnabled} />
                                     {selected ? <Check className="canvas-model-picker-option-check" style={{ color: theme.node.activeStroke }} /> : null}
                                 </button>
                             );
@@ -172,7 +187,7 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
                     <span className="canvas-model-picker-label flex min-w-0 items-center gap-1.5">
                         <span className="canvas-model-picker-trigger-icon" style={{ background: theme.toolbar.itemHover }}><ModelIcon model={current} /></span>
                         <span className="min-w-0 flex-1 truncate">{current ? creationVariant ? modelDisplayName(config, current) : modelOptionLabel(config, current) : placeholder}</span>
-                        {showSelectedPrice ? <ModelPrice price={currentPrice} compact /> : null}
+                        {showSelectedPrice && creditsEnabled ? <ModelPrice price={currentPrice} compact /> : null}
                     </span>
                     <ChevronDown className={cn("canvas-model-picker-chevron", open && "is-open")} aria-hidden="true" />
                 </button>
@@ -187,7 +202,7 @@ function emptyModelLabel(config: AiConfig, capability?: ModelCapability) {
     return config.models.length ? `暂无匹配的${label}模型` : "请先到配置里添加渠道和模型";
 }
 
-function ModelLabel({ config, model, capability, theme, creationVariant }: { config: AiConfig; model: string; capability?: ModelCapability; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; creationVariant: boolean }) {
+function ModelLabel({ config, model, capability, theme, creationVariant, showPrice }: { config: AiConfig; model: string; capability?: ModelCapability; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; creationVariant: boolean; showPrice: boolean }) {
     const meta = modelMenuMeta(model, capability);
     return (
         <span className="flex w-full min-w-0 items-center gap-1.5 overflow-hidden py-0">
@@ -198,7 +213,7 @@ function ModelLabel({ config, model, capability, theme, creationVariant }: { con
                 <span className="block min-w-0 truncate text-[var(--fs-label)] font-medium leading-none">{modelDisplayName(config, model)}</span>
                 <span className="mt-1 block truncate text-[var(--fs-tiny)]" style={{ color: theme.node.muted }} title={meta.description}>{meta.description}</span>
             </span>
-            <ModelPrice price={modelMenuPrice(config, model)} />
+            {showPrice ? <ModelPrice price={modelMenuPrice(config, model)} /> : null}
             {!creationVariant && meta.time ? <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[var(--fs-tiny)] tabular-nums" style={{ background: theme.toolbar.itemHover, color: theme.node.muted }}>{meta.time}</span> : null}
         </span>
     );
@@ -246,7 +261,8 @@ function modelMenuMeta(model: string, capability?: ModelCapability): { descripti
 
 export function ModelIcon({ model }: { model: string }) {
     const icon = resolveModelIcon(modelOptionName(model));
-    return icon ? <img src={icon} alt="" className="size-3.5 shrink-0 dark:invert" /> : <Cpu className="size-3.5 shrink-0 opacity-70" />;
+    const monochrome = icon === "/icons/openai.svg" || icon === "/icons/grok.svg";
+    return icon ? <img src={icon} alt="" className={cn("size-3.5 shrink-0", monochrome && "dark:invert")} /> : <Cpu className="size-3.5 shrink-0 opacity-70" />;
 }
 
 export function resolveModelIcon(model: string) {

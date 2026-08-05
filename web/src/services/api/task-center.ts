@@ -230,8 +230,8 @@ export function recoverGenerationTasks(submissionIds: string[]) {
     return request<GenerationTask[]>(api.post("/tasks/recover", { submissionIds: uniqueIds }));
 }
 
-export function queryGenerationTask(id: string) {
-    return request<GenerationTask>(api.get(`/tasks/${encodeURIComponent(id)}`));
+export function queryGenerationTask(id: string, options?: { signal?: AbortSignal }) {
+    return request<GenerationTask>(api.get(`/tasks/${encodeURIComponent(id)}`, { signal: options?.signal }));
 }
 
 export function retryGenerationTask(id: string) {
@@ -269,7 +269,7 @@ export async function waitForGenerationTask(id: string, options?: { signal?: Abo
             if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
             let task: GenerationTask;
             try {
-                task = await queryGenerationTask(id);
+                task = await queryGenerationTask(id, { signal: options?.signal });
                 lastTask = task;
                 lastQueryError = undefined;
                 options?.onTaskUpdate?.(task);

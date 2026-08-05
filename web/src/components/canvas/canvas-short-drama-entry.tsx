@@ -82,6 +82,21 @@ export function CanvasShortDramaEmptyState({ onCreatePipeline, onOpenAgent, onUp
     );
 }
 
+export function CanvasFreeformEmptyState({ onUpload, onAddText }: { onUpload: () => void; onAddText: () => void }) {
+    const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    return (
+        <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center px-4 pb-20 pt-24">
+            <div className="pointer-events-auto w-full max-w-[440px] rounded-lg border p-4 shadow-sm backdrop-blur" data-canvas-no-zoom style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}>
+                <div className="text-center"><h2 className="text-base font-semibold">从空白画布开始</h2><p className="mt-1 text-xs" style={{ color: theme.node.muted }}>添加文本或导入已有素材。</p></div>
+                <div className="mt-4 grid grid-cols-2 gap-2">
+                    <button type="button" onClick={onAddText} className="inline-flex h-10 items-center justify-center gap-2 rounded-md border text-sm font-medium" style={{ borderColor: theme.node.stroke, background: theme.node.fill }}><Type className="size-4" />新建文本</button>
+                    <button type="button" onClick={onUpload} className="inline-flex h-10 items-center justify-center gap-2 rounded-md border text-sm font-medium" style={{ borderColor: theme.node.stroke, background: theme.node.fill }}><Upload className="size-4" />导入素材</button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function PathCard({ icon, title, description, action, accent, theme, focusStyle, onClick }: {
     icon: ReactNode;
     title: string;
@@ -115,13 +130,13 @@ export function CanvasShortDramaGuide({ progress, collapsed, onToggle, onSkip, o
     if (!progress.active) return null;
     if (collapsed) {
         return (
-            <button type="button" data-canvas-no-zoom className="absolute left-[calc(50%+64px)] top-2 z-[var(--z-toolbar-floating)] inline-flex h-8 max-w-[calc(50vw-76px)] min-w-0 items-center gap-2 rounded-lg border px-3 text-xs font-medium shadow-sm backdrop-blur outline-none focus-visible:ring-2" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text, "--tw-ring-color": theme.accent.primary } as CSSProperties} onClick={onToggle}>
+            <button type="button" data-canvas-no-zoom className="absolute left-[calc(50%+64px)] top-2 z-[var(--z-toolbar)] inline-flex h-8 max-w-[calc(50vw-76px)] min-w-0 items-center gap-2 rounded-lg border px-3 text-xs font-medium shadow-sm backdrop-blur outline-none focus-visible:ring-2" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text, "--tw-ring-color": theme.accent.primary } as CSSProperties} onClick={onToggle}>
                 <Clapperboard className="size-3.5 shrink-0" /><span className="truncate">短剧流程 {progress.completedCount}/5</span><ChevronDown className="size-3 shrink-0" />
             </button>
         );
     }
     return (
-        <div data-canvas-no-zoom className="absolute left-1/2 top-[68px] z-[var(--z-toolbar-floating)] flex max-w-[calc(100%_-_24px)] -translate-x-1/2 items-center gap-1 rounded-lg border p-1 shadow-sm backdrop-blur" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}>
+        <div data-canvas-no-zoom className="absolute left-1/2 top-[68px] z-[var(--z-toolbar)] flex max-w-[calc(100%_-_24px)] -translate-x-1/2 items-center gap-1 rounded-lg border p-1 shadow-sm backdrop-blur" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}>
             <div className="hide-scrollbar flex max-w-[min(760px,calc(100vw-150px))] items-center overflow-x-auto">
                 {progress.steps.map((step, index) => (
                     <span key={step.id} className="flex shrink-0 items-center">

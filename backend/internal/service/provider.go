@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -310,50 +309,7 @@ func (s *Service) hydrateProviderMedia(userID string, media *providerMedia, requ
 		if resource.Status != "ready" {
 			return errors.New("任务参考资源尚未上传完成")
 		}
-		// 本地素材自动迁移到 OSS
-		if resource.Provider == "local" {
-			setting, storageSettingID, useOSS, ossErr := s.activeResourceOSSSetting(userID)
-			if ossErr != nil || !useOSS || setting.Provider != "aliyun" {
-				return errors.New("当前 JSON 视频协议的参考素材需要公网可访问地址，请启用 OSS 后重新上传该素材")
-			}
-			// 读取本地文件并上传到 OSS
-			_, body, readErr := s.OpenResource(userID, resourceID)
-			if readErr != nil {
-				return fmt.Errorf("读取本地素材失败：%w", readErr)
-			}
-			ossKey := ossObjectKey(setting, userID, resource.Kind, filepath.Base(resource.ObjectKey), time.Now())
-			if _, uploadErr := putOSSObject(setting, ossKey, resource.MimeType, resource.Size, body); uploadErr != nil {
-				body.Close()
-				return fmt.Errorf("素材迁移到 OSS 失败：%w", uploadErr)
-			}
-			body.Close()
-			// 更新资源记录
-			resource.Provider = "aliyun"
-			resource.ObjectKey = ossKey
-			resource.Endpoint = setting.Endpoint
-			resource.Bucket = setting.Bucket
-			resource.StorageSettingID = storageSettingID
-			if saveErr := s.repo.SaveResource(resource); saveErr != nil {
-				return fmt.Errorf("更新资源记录失败：%w", saveErr)
-			}
-			// 生成签名 URL
-			signedURL, signErr := signedOSSObjectURL(setting, ossKey, time.Now().Add(providerResourceURLTTL))
-			if signErr != nil {
-				return fmt.Errorf("生成 OSS 签名地址失败：%w", signErr)
-			}
-			media.URL = signedURL
-			media.DataURL = ""
-			media.MimeType = firstNonEmpty(media.MimeType, resource.MimeType)
-			return nil
-		}
-		setting, err := s.ossSettingForResource(userID, resource)
-		if err != nil {
-			return err
-		}
-		if setting.Provider != "aliyun" {
-			return errors.New("当前 JSON 视频协议的私有参考素材暂时只支持阿里云 OSS 签名地址")
-		}
-		signedURL, err := signedOSSObjectURL(setting, resource.ObjectKey, time.Now().Add(providerResourceURLTTL))
+		signedURL, err := s.directResourceURL(resource, time.Now().Add(providerResourceURLTTL))
 		if err != nil {
 			return fmt.Errorf("生成 JSON 视频协议参考素材地址失败：%w", err)
 		}
@@ -2698,8 +2654,27 @@ func normalizeImageQuality(value string) string {
 
 func normalizePixelSize(value string) string {
 	value = strings.TrimSpace(value)
-	if value == "" || value == "auto" || strings.Contains(value, ":") {
+	if value == "" || value == "auto" {
 		return ""
+	}
+	// 画布按比例保存常用预设；图片接口只接受像素尺寸，必须在请求边界完成转换。
+	switch value {
+	case "1:1":
+		return "1024x1024"
+	case "3:2":
+		return "1536x1024"
+	case "2:3":
+		return "1024x1536"
+	case "4:3":
+		return "1360x1024"
+	case "3:4":
+		return "1024x1360"
+	case "16:9":
+		return "1824x1024"
+	case "9:16":
+		return "1024x1824"
+	case "21:9":
+		return "2352x1008"
 	}
 	if strings.Contains(value, "x") {
 		return value

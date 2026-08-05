@@ -50,6 +50,15 @@ function isConfigSection(value: string | null): value is ConfigSectionKey {
     return configSections.some((section) => section.key === value);
 }
 
+function channelModelFetchErrorMessage(error: unknown) {
+    const detail = error instanceof Error ? error.message : "读取模型失败";
+    // 私网地址会在实际生成时继续被 SSRF 防护拦截，不能提示用户靠手填模型绕过。
+    if (detail.includes("不允许访问本机") || detail.includes("不允许访问保留地址")) {
+        return `${detail}；可信私网服务需由部署管理员配置 CANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS`;
+    }
+    return `${detail}；也可以直接在模型列表中手动输入模型名`;
+}
+
 export default function SettingsPage() {
     const { message } = App.useApp();
     const navigate = useNavigate();
@@ -184,7 +193,7 @@ export default function SettingsPage() {
             );
             message.success(`${latestChannel.name || "当前渠道"}模型列表已更新`);
         } catch (error) {
-            message.error(error instanceof Error ? `${error.message}；也可以直接在模型列表中手动输入模型名` : "读取模型失败，可直接手动输入模型名");
+            message.error(channelModelFetchErrorMessage(error));
         } finally {
             setChannelLoading(channel.id, false);
         }
@@ -244,7 +253,7 @@ export default function SettingsPage() {
     };
 
     return (
-        <main className="flex h-full min-h-0 flex-col bg-background text-foreground">
+        <main className="flex h-full min-h-0 flex-col bg-[var(--workspace-canvas)] text-foreground">
             <header className="flex min-h-16 shrink-0 items-center justify-between gap-4 border-b border-border/70 px-4 py-3 sm:px-5">
                 <div className="flex min-w-0 items-center gap-3">
                     {shouldPromptContinue ? (
@@ -259,7 +268,7 @@ export default function SettingsPage() {
                 {shouldPromptContinue ? <Button type="primary" onClick={finishConfig}>保存并返回创作</Button> : null}
             </header>
             <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-                <aside className="w-full shrink-0 border-b border-border/70 bg-muted/[.12] p-2 md:w-[224px] md:border-b-0 md:border-r md:p-3">
+                <aside className="w-full shrink-0 border-b border-border/70 bg-transparent p-2 md:w-[224px] md:border-b-0 md:border-r md:p-3">
                     <nav className="thin-scrollbar flex gap-1 overflow-x-auto md:block md:space-y-1" aria-label="配置分类">
                         {configSections.map((item) => {
                             const selected = item.key === activeTab;
@@ -279,8 +288,8 @@ export default function SettingsPage() {
                     </nav>
                 </aside>
 
-                <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
-                    <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 md:px-6 md:py-5">
+                <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-transparent">
+                    <div className="app-workspace-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 md:px-6 md:py-5">
                         <div className={activeTab === "prompts" ? "h-full w-full" : "mx-auto w-full max-w-[1180px]"}>
                     {([
                     {

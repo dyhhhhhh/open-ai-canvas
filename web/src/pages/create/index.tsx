@@ -11,16 +11,18 @@ import { canvasResourceMentionToken } from "@/lib/canvas/canvas-resource-referen
 import { createClientId } from "@/lib/client-id";
 import { generationErrorMessage } from "@/lib/generation-error";
 import { VIDEO_RESOLUTION_OPTIONS } from "@/lib/video-generation-options";
-import { isGenerationTaskSubmissionUncertain, parseBackendGenerationResult, submitBackendGenerationTask, submitBackendGenerationTaskBatch } from "@/services/api/generation-task";
+import { isGenerationTaskSubmissionUncertain, parseBackendGenerationResult, submitBackendGenerationTask, submitBackendGenerationTaskBatch, type BackendGenerationResult } from "@/services/api/generation-task";
 import { listAddedSkills, type Skill } from "@/services/api/skills";
 import { cancelGenerationTask, getTaskTextChunks, listGenerationTasks, queryGenerationTask, recoverGenerationTasks, taskTextEventsUrl, type GenerationTask, type TaskTextStream } from "@/services/api/task-center";
+import { storeGeneratedVideo } from "@/services/api/video";
+import { resolveImageUrl, uploadImage, type UploadedImage } from "@/services/image-storage";
 import { modelDisplayName, modelOptionName, selectableModelsByCapability, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
-import type { ReferenceImage } from "@/types/image";
+import { useAssetStore, type NewAsset } from "@/stores/use-asset-store";
 import { buildCreationMentionReferences, creationReferenceMetadata, displayCreationPrompt, expandCreationPrompt, selectedCreationReferences, type CreationReference } from "./creation-references";
+import { creationAssetKey, creationAttachmentFromImage, creationImageAsset, creationVideoAsset, isSameCreationAsset, type CreationAssetIdentity, type CreationAttachment } from "./creation-assets";
 
 type CreationMode = "text" | "image" | "video";
 type CreationStatus = "streaming" | "pending" | "done" | "error" | "cancelled" | "draft";
-type CreationAttachment = ReferenceImage & { previewUrl: string };
 type CreationSettings = { ratio: string; seconds: string; quality: string; videoQuality: string; count: string };
 type CreationMessage = {
     id: string;
@@ -70,10 +72,35 @@ function newMessage(role: CreationMessage["role"], content: string, extra: Parti
     return { id: createClientId(), role, content, createdAt: new Date().toISOString(), ...extra };
 }
 
+type CreationImageResult = NonNullable<BackendGenerationResult["images"]>[number];
+
+async function persistCreationImageResult(image: CreationImageResult): Promise<UploadedImage> {
+    if (!image.storageKey) return uploadImage(image.dataUrl);
+    const url = await resolveImageUrl(image.storageKey, image.dataUrl);
+    if (!url) throw new Error("图片结果资源不可用");
+    return {
+        url,
+        storageKey: image.storageKey,
+        width: image.width || 1024,
+        height: image.height || 1024,
+        bytes: image.bytes || 0,
+        mimeType: image.mimeType || "image/png",
+    };
+}
+
+function addCreationAssetOnce(asset: NewAsset, identity: CreationAssetIdentity) {
+    const store = useAssetStore.getState();
+    const key = creationAssetKey(identity);
+    if (key && store.assets.some((existing) => isSameCreationAsset(existing, identity))) return false;
+    store.addAsset(key ? { ...asset, metadata: { ...asset.metadata, creationAssetKey: key } } : asset);
+    return true;
+}
+
 export default function CreatePage() {
     const { message: toast } = App.useApp();
     const config = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
+    const addAsset = useAssetStore((state) => state.addAsset);
     const [conversations, setConversations] = useState<CreationConversation[]>([]);
     const [activeId, setActiveId] = useState("");
     const [hydrated, setHydrated] = useState(false);
@@ -93,6 +120,7 @@ export default function CreatePage() {
     const threadScrollRef = useRef<HTMLElement>(null);
     const followLatestMessageRef = useRef(true);
     const taskSyncWarningRef = useRef(false);
+    const taskSyncInFlightRef = useRef(false);
     const conversationsRef = useRef<CreationConversation[]>([]);
     const textEventSourcesRef = useRef<Map<string, EventSource>>(new Map());
 
@@ -133,6 +161,8 @@ export default function CreatePage() {
         if (!hydrated || !pendingCreationKey) return;
         let cancelled = false;
         const syncTasks = async () => {
+            if (taskSyncInFlightRef.current) return;
+            taskSyncInFlightRef.current = true;
             try {
                 const snapshot = conversationsRef.current;
                 const knownTaskIds = creationPendingTaskIds(snapshot);
@@ -146,12 +176,13 @@ export default function CreatePage() {
                 const streams = await Promise.all(tasks
                     .filter((task) => task.type === "canvas_text")
                     .map((task) => getTaskTextChunks(task.id, creationTextCursor(snapshot, task.id)).catch(() => null)));
+                const persistedTasks = await persistCreationTaskResults(tasks);
                 if (cancelled) return;
                 taskSyncWarningRef.current = false;
                 setConversations((current) => {
-                    const attached = attachRecoveredCreationTasks(current, [...tasks, ...recovered, ...legacySummaries]);
+                    const attached = attachRecoveredCreationTasks(current, [...persistedTasks, ...recovered, ...legacySummaries]);
                     const withText = mergeCreationTextStreams(attached, streams.filter((stream): stream is TaskTextStream => Boolean(stream)));
-                    return reconcileCreationTaskMessages(withText, tasks);
+                    return reconcileCreationTaskMessages(withText, persistedTasks);
                 });
             } catch (error) {
                 if (cancelled) return;
@@ -160,6 +191,8 @@ export default function CreatePage() {
                     taskSyncWarningRef.current = true;
                     toast.warning("任务状态暂时无法同步，请稍后刷新");
                 }
+            } finally {
+                taskSyncInFlightRef.current = false;
             }
         };
         void syncTasks();
@@ -241,12 +274,19 @@ export default function CreatePage() {
     };
 
     const addAttachments = (files: FileList | File[]) => {
-        const next = Array.from(files).filter((file) => file.type.startsWith("image/"));
+        const next = Array.from(files).filter((file) => file.type.startsWith("image/")).slice(0, Math.max(0, 6 - attachments.length));
         if (!next.length) return;
-        void Promise.all(next.slice(0, 6).map(async (file) => {
-            const dataUrl = await readFileAsDataUrl(file);
-            return { id: createClientId(), name: file.name, type: file.type, dataUrl, previewUrl: dataUrl } satisfies CreationAttachment;
-        })).then((items) => setAttachments((current) => [...current, ...items].slice(0, 6))).catch(() => toast.error("参考图读取失败，请重试"));
+        void Promise.allSettled(next.map(async (file) => {
+            const uploaded = await uploadImage(file);
+            const attachment = creationAttachmentFromImage(file, uploaded);
+            addAsset(creationImageAsset({ title: file.name, uploaded, metadata: { source: "create-upload", fileName: file.name } }));
+            return attachment;
+        })).then((settled) => {
+            const items = settled.flatMap((entry) => entry.status === "fulfilled" ? [entry.value] : []);
+            const failed = settled.filter((entry) => entry.status === "rejected");
+            if (items.length) setAttachments((current) => [...current, ...items].slice(0, 6));
+            if (failed.length) toast.error(`${failed.length} 张参考图片上传失败，请重试`);
+        });
     };
 
     const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -278,7 +318,7 @@ export default function CreatePage() {
         followLatestMessageRef.current = true;
         const userMessage = source || newMessage("user", text, { mode: requestMode, model: requestModel, attachments: requestAttachments, references, settings: requestSettings });
         const taskCount = requestMode === "image" ? Math.max(1, Math.min(15, Math.floor(Number(requestSettings.count) || 1))) : 1;
-        const submissionIds = Array.from({ length: taskCount }, () => crypto.randomUUID());
+        const submissionIds = Array.from({ length: taskCount }, () => createClientId());
         const assistantMessage = newMessage("assistant", "", { mode: requestMode, model: requestModel, status: "pending", settings: requestSettings, submissionIds });
         const boundTaskIds = new Set<string>();
         const bindTask = (task: GenerationTask) => {
@@ -774,7 +814,62 @@ function mergeCreationTextStreams(conversations: CreationConversation[], streams
     }));
 }
 
-function reconcileCreationTaskMessages(conversations: CreationConversation[], tasks: GenerationTask[]) {
+type PersistedCreationTask = GenerationTask & { creationResultUrls?: string[]; creationError?: string };
+
+async function persistCreationTaskResults(tasks: GenerationTask[]): Promise<PersistedCreationTask[]> {
+    return Promise.all(tasks.map(async (task): Promise<PersistedCreationTask> => {
+        if (task.status !== "succeeded" || !task.clientContext) return task;
+        try {
+            const result = task.resultJson ? parseBackendGenerationResult(task) : null;
+            const images = result?.images?.length ? result.images : task.previewUrl && task.previewKind !== "video" ? [{ dataUrl: task.previewUrl }] : [];
+            if (images.length) {
+                const storedImages = await Promise.all(images.map(async (image, resultIndex) => {
+                    const uploaded = await persistCreationImageResult(image);
+                    addCreationAssetOnce(creationImageAsset({
+                        title: task.prompt.slice(0, 24),
+                        uploaded,
+                        metadata: {
+                            source: "create-generation",
+                            taskId: task.id,
+                            conversationId: task.clientContext?.conversationId,
+                            messageId: task.clientContext?.messageId,
+                            batchIndex: task.clientContext?.batchIndex,
+                            resultIndex,
+                            prompt: task.prompt,
+                        },
+                    }), { taskId: task.id, messageId: task.clientContext?.messageId, resultIndex });
+                    return uploaded.url;
+                }));
+                return { ...task, creationResultUrls: storedImages };
+            }
+
+            const videoUrl = result?.video?.dataUrl || (task.previewKind === "video" ? task.previewUrl : "");
+            if (videoUrl) {
+                const storedVideo = await storeGeneratedVideo({ url: videoUrl, mimeType: result?.video?.mimeType || "video/mp4" });
+                if (!storedVideo.url) throw new Error("视频结果资源不可用");
+                addCreationAssetOnce(creationVideoAsset({
+                    title: task.prompt.slice(0, 24),
+                    uploaded: storedVideo,
+                    metadata: {
+                        source: "create-generation",
+                        taskId: task.id,
+                        conversationId: task.clientContext?.conversationId,
+                        messageId: task.clientContext?.messageId,
+                        batchIndex: task.clientContext?.batchIndex,
+                        resultIndex: 0,
+                        prompt: task.prompt,
+                    },
+                }), { taskId: task.id, messageId: task.clientContext?.messageId, resultIndex: 0 });
+                return { ...task, creationResultUrls: [storedVideo.url] };
+            }
+            return task;
+        } catch (error) {
+            return { ...task, creationError: error instanceof Error ? error.message : "生成结果资源化失败" };
+        }
+    }));
+}
+
+function reconcileCreationTaskMessages(conversations: CreationConversation[], tasks: PersistedCreationTask[]) {
     let changed = false;
     const next = conversations.map((conversation) => {
         let conversationChanged = false;
@@ -805,15 +900,14 @@ function reconcileCreationTaskMessages(conversations: CreationConversation[], ta
             }
 
             const resultUrls = Array.from(new Set(matches.filter((task) => task.status === "succeeded").flatMap(creationTaskResultUrls)));
-            const succeededCount = matches.filter((task) => task.status === "succeeded").length;
-            const failedCount = matches.length - succeededCount;
+            const failedCount = matches.filter((task) => task.status !== "succeeded" || Boolean(task.creationError)).length;
             if (resultUrls.length) {
                 const content = message.mode === "video" ? "视频已生成" : failedCount ? `${resultUrls.length} 张图片已生成，${failedCount} 张失败` : "图片已生成";
                 return { ...message, status: "done" as const, content, resultUrls, error: undefined, taskIds: nextTaskIds };
             }
             if (matches.every((task) => task.status === "cancelled")) return { ...message, status: "cancelled" as const, content: message.content, error: undefined, taskIds: nextTaskIds };
-            const failed = matches.find((task) => task.status === "failed");
-            return { ...message, status: "error" as const, content: message.content || "生成失败", error: generationErrorMessage(failed?.error || "任务已结束，但生成结果暂时无法读取"), taskIds: nextTaskIds };
+            const failed = matches.find((task) => task.status === "failed" || task.creationError);
+            return { ...message, status: "error" as const, content: message.content || "生成失败", error: generationErrorMessage(failed?.creationError || failed?.error || "任务已结束，但生成结果暂时无法读取"), taskIds: nextTaskIds };
         });
         return conversationChanged ? { ...conversation, messages, updatedAt: completedAt } : conversation;
     });
@@ -838,15 +932,8 @@ function creationTextTaskPrompt(history: CreationMessage[], current: CreationMes
     ].join("\n\n");
 }
 
-function creationTaskResultUrls(task: GenerationTask) {
-    if (task.previewUrl) return [task.previewUrl];
-    if (!task.resultJson) return [];
-    try {
-        const result = parseBackendGenerationResult(task);
-        return [...(result.images || []).map((image) => image.dataUrl), result.video?.dataUrl].filter((url): url is string => Boolean(url));
-    } catch {
-        return [];
-    }
+function creationTaskResultUrls(task: PersistedCreationTask) {
+    return task.creationResultUrls || [];
 }
 
 function conversationTimestamp(value: string) {
@@ -866,5 +953,3 @@ function ratioPreviewStyle(value: string) {
     const scale = Math.min(28 / width, 20 / height);
     return { width: Math.max(8, width * scale), height: Math.max(8, height * scale) };
 }
-
-function readFileAsDataUrl(file: File) { return new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error || new Error("文件读取失败")); reader.readAsDataURL(file); }); }
