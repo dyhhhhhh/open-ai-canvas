@@ -71,6 +71,7 @@ const (
 	ChannelInterfaceGeminiImage           ChannelInterfaceType = "gemini-image"
 	ChannelInterfaceOpenAIAudio           ChannelInterfaceType = "openai-audio"
 	ChannelInterfaceAsyncAudio            ChannelInterfaceType = "async-audio"
+	ChannelInterfaceVolcenginePlanTTS     ChannelInterfaceType = "volcengine-plan-tts"
 	ChannelInterfaceNewAPIVideo           ChannelInterfaceType = "newapi"
 	ChannelInterfaceNewAPIChannel1        ChannelInterfaceType = "newapi-channel-1"
 	ChannelInterfaceNewAPIChannel2        ChannelInterfaceType = "newapi-channel-2"

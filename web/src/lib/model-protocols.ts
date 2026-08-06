@@ -8,6 +8,7 @@ export type ModelProtocol =
     | "gemini-image"
     | "openai-audio"
     | "async-audio"
+    | "volcengine-plan-tts"
     | "newapi"
     | "newapi-channel-1"
     | "newapi-channel-2"
@@ -39,6 +40,7 @@ export const MODEL_PROTOCOLS: ModelProtocolDefinition[] = [
     { value: "gemini-image", label: "Gemini Images", capability: "image", create: "POST /v1beta/models/{model}:generateContent", contentType: "application/json", media: "文生图、图片编辑与多张内嵌参考图" },
     { value: "openai-audio", label: "OpenAI Audio", capability: "audio", create: "POST /v1/audio/speech", contentType: "application/json", media: "文本转语音" },
     { value: "async-audio", label: "异步音频任务", capability: "audio", create: "POST /v1/audio/tasks", poll: "GET /v1/audio/tasks/{task_id}", contentType: "application/json", media: "语音、音效与音乐生成" },
+    { value: "volcengine-plan-tts", label: "火山 Agent Plan 语音", capability: "audio", create: "POST /api/v3/plan/tts/unidirectional", contentType: "application/json + X-Api-*", media: "Seed-TTS 2.0 文本转语音" },
     { value: "newapi", label: "OpenAI / NewAPI Videos", capability: "video", create: "POST /v1/videos", poll: "GET /v1/videos/{task_id}", contentType: "multipart/form-data", media: "input_reference[] 参考图" },
     { value: "newapi-channel-1", label: "NewAPI 媒体任务", capability: "video", create: "POST /v1/videos", poll: "GET /v1/videos/{task_id}", contentType: "application/json", media: "图片、视频、音频公网 URL" },
     {
