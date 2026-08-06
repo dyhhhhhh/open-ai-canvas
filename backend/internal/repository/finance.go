@@ -224,7 +224,11 @@ func (r *Repository) RetryTaskWithBilling(userID string, taskID string, order *m
 		}
 		updates := map[string]any{
 			"status": model.TaskStatusQueued, "stage": "等待队列调度", "progress": 5, "error": "", "result_json": "",
-			"text_draft": "", "started_at": nil, "completed_at": nil, "updated_at": time.Now(),
+			"text_draft": "", "started_at": nil, "completed_at": nil,
+			"provider_request_id": "", "poll_stage": "", "next_poll_at": nil,
+			"provider_cancel_status": "", "provider_cancel_error": "", "provider_cancel_attempts": 0,
+			"provider_cancel_requested_at": nil, "provider_cancelled_at": nil, "provider_cancel_next_check_at": nil,
+			"lease_owner": "", "lease_expires_at": nil, "updated_at": time.Now(),
 		}
 		if order != nil {
 			updates["billing_order_id"] = order.ID
@@ -434,6 +438,7 @@ func (r *Repository) MarkBillingRunning(id string) error {
 }
 
 func (r *Repository) MarkBillingUncertain(id string, errorText string) error {
+	// uncertain 保留冻结积分，直到人工核对；这里故意不自动结算或退款。
 	return r.db.Model(&model.BillingOrder{}).
 		Where("id = ? AND status IN ?", id, []model.BillingStatus{model.BillingStatusReserved, model.BillingStatusRunning}).
 		Updates(map[string]any{"status": model.BillingStatusUncertain, "error": errorText, "updated_at": time.Now()}).Error

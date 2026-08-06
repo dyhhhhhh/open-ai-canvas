@@ -197,7 +197,7 @@ func RegisterTaskRoutes(r *gin.RouterGroup, svc *service.Service) {
 			failService(c, err)
 			return
 		}
-		task, err := svc.CancelTask(user.ID, c.Param("id"))
+		task, err := svc.CancelTask(c.Request.Context(), user.ID, c.Param("id"))
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
@@ -235,7 +235,7 @@ func taskTextAfterCursor(c *gin.Context) (int64, error) {
 }
 
 func streamTaskTextEvents(c *gin.Context, svc *service.Service, userID string, taskID string, after int64) {
-	c.Header("Content-Type", "text/event-stream")
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
 	c.Header("Cache-Control", "no-cache, no-transform")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
@@ -275,7 +275,7 @@ func streamTaskTextEvents(c *gin.Context, svc *service.Service, userID string, t
 	}
 }
 
-func writeTaskTextSSE(c *gin.Context, event string, id int64, value interface{}) {
+func writeTaskTextSSE(c *gin.Context, event string, id int64, value any) {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return
@@ -364,6 +364,7 @@ func RegisterSessionRoutes(r *gin.RouterGroup, svc *service.Service) {
 	r.GET("/sessions/:id", querySession)
 	r.POST("/files", uploadFile)
 	r.GET("/sessions/:id/results", downloadResults)
+	// 兼容旧客户端的废弃路由；新调用统一使用上方 REST 风格路径。
 	r.POST("/create_session", createSession)
 	r.GET("/query_session/:id", querySession)
 	r.POST("/upload_file", uploadFile)

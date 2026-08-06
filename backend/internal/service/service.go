@@ -74,29 +74,34 @@ type SessionDetail struct {
 }
 
 type TaskSummary struct {
-	ID                string              `json:"id"`
-	SubmissionID      string              `json:"submissionId,omitempty"`
-	SessionID         string              `json:"sessionId,omitempty"`
-	ProjectID         string              `json:"projectId,omitempty"`
-	Type              string              `json:"type"`
-	Status            model.TaskStatus    `json:"status"`
-	Stage             string              `json:"stage"`
-	Progress          int                 `json:"progress"`
-	Prompt            string              `json:"prompt"`
-	Operation         string              `json:"operation,omitempty"`
-	Provider          string              `json:"provider,omitempty"`
-	Model             string              `json:"model,omitempty"`
-	ProviderRequestID string              `json:"providerRequestId,omitempty"`
-	ErrorCode         string              `json:"errorCode,omitempty"`
-	PreviewURL        string              `json:"previewUrl,omitempty"`
-	PreviewKind       string              `json:"previewKind,omitempty"`
-	Attempts          int                 `json:"attempts"`
-	StartedAt         *time.Time          `json:"startedAt"`
-	CompletedAt       *time.Time          `json:"completedAt"`
-	CreatedAt         time.Time           `json:"createdAt"`
-	UpdatedAt         time.Time           `json:"updatedAt"`
-	Billing           *TaskBillingSummary `json:"billing,omitempty"`
-	ClientContext     *TaskClientContext  `json:"clientContext,omitempty"`
+	ID                        string                     `json:"id"`
+	SubmissionID              string                     `json:"submissionId,omitempty"`
+	SessionID                 string                     `json:"sessionId,omitempty"`
+	ProjectID                 string                     `json:"projectId,omitempty"`
+	Type                      string                     `json:"type"`
+	Status                    model.TaskStatus           `json:"status"`
+	Stage                     string                     `json:"stage"`
+	Progress                  int                        `json:"progress"`
+	Prompt                    string                     `json:"prompt"`
+	Operation                 string                     `json:"operation,omitempty"`
+	Provider                  string                     `json:"provider,omitempty"`
+	Model                     string                     `json:"model,omitempty"`
+	ProviderRequestID         string                     `json:"providerRequestId,omitempty"`
+	ProviderCancelStatus      model.ProviderCancelStatus `json:"providerCancelStatus,omitempty"`
+	ProviderCancelError       string                     `json:"providerCancelError,omitempty"`
+	ProviderCancelAttempts    int                        `json:"providerCancelAttempts,omitempty"`
+	ProviderCancelRequestedAt *time.Time                 `json:"providerCancelRequestedAt,omitempty"`
+	ProviderCancelledAt       *time.Time                 `json:"providerCancelledAt,omitempty"`
+	ErrorCode                 string                     `json:"errorCode,omitempty"`
+	PreviewURL                string                     `json:"previewUrl,omitempty"`
+	PreviewKind               string                     `json:"previewKind,omitempty"`
+	Attempts                  int                        `json:"attempts"`
+	StartedAt                 *time.Time                 `json:"startedAt"`
+	CompletedAt               *time.Time                 `json:"completedAt"`
+	CreatedAt                 time.Time                  `json:"createdAt"`
+	UpdatedAt                 time.Time                  `json:"updatedAt"`
+	Billing                   *TaskBillingSummary        `json:"billing,omitempty"`
+	ClientContext             *TaskClientContext         `json:"clientContext,omitempty"`
 }
 
 type TaskClientContext struct {
@@ -164,20 +169,20 @@ type agentStoryboardPlan struct {
 }
 
 type agentStoryboardShot struct {
-	Title        string   `json:"title"`
-	Description  string   `json:"description"`
-	Duration     int      `json:"durationSeconds"`
-	Dialogue     string   `json:"dialogue"`
-	ShotSize     string   `json:"shotSize"`
-	Emotion      string   `json:"emotion"`
-	Lighting     string   `json:"lightingAndAtmosphere"`
-	AudioEffects string   `json:"audioEffects"`
-	VisualPrompt string   `json:"visualPrompt"`
-	VideoPrompt  string   `json:"videoPrompt"`
-	Camera       string   `json:"camera"`
-	Motion       string   `json:"motion"`
-	TimeBeats    string   `json:"timeBeats"`
-	Negative     string   `json:"negativePrompt"`
+	Title         string   `json:"title"`
+	Description   string   `json:"description"`
+	Duration      int      `json:"durationSeconds"`
+	Dialogue      string   `json:"dialogue"`
+	ShotSize      string   `json:"shotSize"`
+	Emotion       string   `json:"emotion"`
+	Lighting      string   `json:"lightingAndAtmosphere"`
+	AudioEffects  string   `json:"audioEffects"`
+	VisualPrompt  string   `json:"visualPrompt"`
+	VideoPrompt   string   `json:"videoPrompt"`
+	Camera        string   `json:"camera"`
+	Motion        string   `json:"motion"`
+	TimeBeats     string   `json:"timeBeats"`
+	Negative      string   `json:"negativePrompt"`
 	AssetTags     []string `json:"assetTags"`
 	CharacterIDs  []string `json:"characterIds"`
 	Intent        string   `json:"narrativeIntent"`
@@ -195,6 +200,8 @@ func New(repo *repository.Repository, dataDir string) *Service {
 
 func (s *Service) StartWorker() {
 	s.startTextReplayCleanup()
+	s.startProviderCancellationReconciliation()
+	s.startBillingReviewAudit()
 	go func() {
 		slots := make(chan struct{}, maxChannelConcurrencyLimit)
 		dispatch := func() {
@@ -330,6 +337,9 @@ func (s *Service) CreateTask(userID string, req CreateTaskRequest) (*model.Task,
 	}
 	normalizedInput, err := normalizeTaskInput(req.Input)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.ValidateTaskCapability(normalizedInput); err != nil {
 		return nil, err
 	}
 	if containsInlineMediaDataURL(normalizedInput) {
@@ -491,6 +501,12 @@ func (s *Service) refreshTaskProviderState(task *model.Task) error {
 	}
 	task.PollStage = latest.PollStage
 	task.NextPollAt = latest.NextPollAt
+	task.ProviderCancelStatus = latest.ProviderCancelStatus
+	task.ProviderCancelError = latest.ProviderCancelError
+	task.ProviderCancelAttempts = latest.ProviderCancelAttempts
+	task.ProviderCancelRequestedAt = latest.ProviderCancelRequestedAt
+	task.ProviderCancelledAt = latest.ProviderCancelledAt
+	task.ProviderCancelNextCheckAt = latest.ProviderCancelNextCheckAt
 	return nil
 }
 
@@ -501,6 +517,9 @@ func (s *Service) RetryTask(userID string, id string) (*model.Task, error) {
 	}
 	if task.Status != model.TaskStatusFailed && task.Status != model.TaskStatusCancelled {
 		return nil, errors.New("only failed or cancelled tasks can be retried")
+	}
+	if task.ProviderCancelStatus == model.ProviderCancelStatusRequested {
+		return nil, BadAuthRequest("上游取消状态仍在确认中，请确认费用结果后再重试")
 	}
 	if isContentModerationFailure(task.Error) {
 		return nil, BadAuthRequest(contentModerationRetryMessage)
@@ -548,7 +567,7 @@ func (s *Service) RetryTask(userID string, id string) (*model.Task, error) {
 	return taskForOutput(*task), nil
 }
 
-func (s *Service) CancelTask(userID string, id string) (*model.Task, error) {
+func (s *Service) CancelTask(ctx context.Context, userID string, id string) (*model.Task, error) {
 	task, err := s.repo.TaskForUser(userID, id)
 	if err != nil {
 		return nil, err
@@ -557,6 +576,7 @@ func (s *Service) CancelTask(userID string, id string) (*model.Task, error) {
 		return nil, errors.New("completed task cannot be cancelled")
 	}
 	now := time.Now()
+	cancelledRunningTask := false
 	if task.Status == model.TaskStatusQueued {
 		cancelled, err := s.repo.CancelTaskIfStatus(userID, task.ID, model.TaskStatusQueued, now)
 		if err != nil {
@@ -578,7 +598,6 @@ func (s *Service) CancelTask(userID string, id string) (*model.Task, error) {
 		}
 	}
 	if task.Status == model.TaskStatusRunning {
-		s.cancelActiveTask(task.ID)
 		cancelled, err := s.repo.CancelTaskIfStatus(userID, task.ID, model.TaskStatusRunning, now)
 		if err != nil {
 			return nil, err
@@ -593,6 +612,8 @@ func (s *Service) CancelTask(userID string, id string) (*model.Task, error) {
 			}
 			task = latest
 		} else {
+			cancelledRunningTask = true
+			s.cancelActiveTask(task.ID)
 			if err := s.MarkBillingUncertain(task.BillingOrderID, "运行中的上游请求被用户取消，费用状态待核对"); err != nil {
 				return nil, err
 			}
@@ -607,6 +628,15 @@ func (s *Service) CancelTask(userID string, id string) (*model.Task, error) {
 	}
 	if task.SessionID != "" {
 		_ = s.markSessionFailed(*task, "会话任务已取消。")
+	}
+	if cancelledRunningTask {
+		if err := s.requestProviderCancellation(ctx, task); err != nil {
+			return nil, err
+		}
+		task, err = s.repo.TaskForUser(userID, id)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := s.finalizeTaskTextReplay(task.ID, model.TaskStatusCancelled); err != nil {
 		_ = s.log(userID, task.ID, "error", "文本回放草稿归并失败", err.Error())
@@ -801,28 +831,33 @@ func taskSummaryForOutput(task model.Task) TaskSummary {
 	}
 	previewURL, previewKind := taskMediaPreview(task.ResultJSON, task.Type)
 	return TaskSummary{
-		ID:                task.ID,
-		SubmissionID:      task.SubmissionID,
-		SessionID:         task.SessionID,
-		ProjectID:         task.ProjectID,
-		Type:              task.Type,
-		Status:            task.Status,
-		Stage:             task.Stage,
-		Progress:          task.Progress,
-		Prompt:            truncateRunes(task.Prompt, 500),
-		Operation:         task.Operation,
-		Provider:          task.Provider,
-		Model:             task.Model,
-		ProviderRequestID: task.ProviderRequestID,
-		ErrorCode:         errorCode,
-		PreviewURL:        previewURL,
-		PreviewKind:       previewKind,
-		Attempts:          task.Attempts,
-		StartedAt:         task.StartedAt,
-		CompletedAt:       task.CompletedAt,
-		CreatedAt:         task.CreatedAt,
-		UpdatedAt:         task.UpdatedAt,
-		ClientContext:     taskClientContext(task.InputJSON),
+		ID:                        task.ID,
+		SubmissionID:              task.SubmissionID,
+		SessionID:                 task.SessionID,
+		ProjectID:                 task.ProjectID,
+		Type:                      task.Type,
+		Status:                    task.Status,
+		Stage:                     task.Stage,
+		Progress:                  task.Progress,
+		Prompt:                    truncateRunes(task.Prompt, 500),
+		Operation:                 task.Operation,
+		Provider:                  task.Provider,
+		Model:                     task.Model,
+		ProviderRequestID:         task.ProviderRequestID,
+		ProviderCancelStatus:      task.ProviderCancelStatus,
+		ProviderCancelError:       task.ProviderCancelError,
+		ProviderCancelAttempts:    task.ProviderCancelAttempts,
+		ProviderCancelRequestedAt: task.ProviderCancelRequestedAt,
+		ProviderCancelledAt:       task.ProviderCancelledAt,
+		ErrorCode:                 errorCode,
+		PreviewURL:                previewURL,
+		PreviewKind:               previewKind,
+		Attempts:                  task.Attempts,
+		StartedAt:                 task.StartedAt,
+		CompletedAt:               task.CompletedAt,
+		CreatedAt:                 task.CreatedAt,
+		UpdatedAt:                 task.UpdatedAt,
+		ClientContext:             taskClientContext(task.InputJSON),
 	}
 }
 
@@ -1051,7 +1086,7 @@ func (s *Service) processClaimedTask(task *model.Task) error {
 		task.Stage = "计费准备失败"
 		task.Error = taskFailureMessage(err)
 		task.CompletedAt = ptr(time.Now())
-		_ = s.repo.Save(task)
+		_, _ = s.repo.UpdateTaskTerminalState(task.ID, model.TaskStatusRunning, task.Status, task.Stage, task.Error, *task.CompletedAt)
 		_ = s.RefundBilling(task.BillingOrderID, "计费准备失败，上游请求未发出")
 		return err
 	}
@@ -1082,7 +1117,7 @@ func (s *Service) processClaimedTask(task *model.Task) error {
 			task.Stage = "任务已取消"
 			task.Error = "任务已取消"
 			task.CompletedAt = ptr(time.Now())
-			_ = s.repo.Save(task)
+			_, _ = s.repo.UpdateTaskTerminalState(task.ID, model.TaskStatusRunning, task.Status, task.Stage, task.Error, *task.CompletedAt)
 			if channelSlotFailedBeforeRequest {
 				_ = s.RefundBilling(task.BillingOrderID, "等待渠道槽位期间取消，上游请求未发出")
 			} else {
@@ -1102,7 +1137,7 @@ func (s *Service) processClaimedTask(task *model.Task) error {
 		task.Stage = "任务失败"
 		task.Error = taskFailureMessage(err)
 		task.CompletedAt = ptr(time.Now())
-		_ = s.repo.Save(task)
+		_, _ = s.repo.UpdateTaskTerminalState(task.ID, model.TaskStatusRunning, task.Status, task.Stage, task.Error, *task.CompletedAt)
 		if compactErr := s.finalizeTaskTextReplay(task.ID, model.TaskStatusFailed); compactErr != nil {
 			_ = s.log(task.UserID, task.ID, "error", "文本回放草稿归并失败", compactErr.Error())
 		}
@@ -1134,11 +1169,20 @@ func (s *Service) processClaimedTask(task *model.Task) error {
 	task.Progress = 90
 	_ = s.repo.UpdateTaskProgress(task.ID, task.Stage, task.Progress)
 	if err := s.saveTaskCompletionWithinStorageQuota(task, resultJSON, opsJSON, len(canvasOps) > 0); err != nil {
+		if errors.Is(err, repository.ErrTaskStateConflict) {
+			latest, latestErr := s.repo.Task(task.ID)
+			if latestErr == nil && latest.Status == model.TaskStatusCancelled {
+				_ = s.MarkBillingUncertain(task.BillingOrderID, "上游已返回结果，但任务被取消")
+				_ = s.markSessionFailed(*latest, "会话任务已取消。")
+				_ = s.log(task.UserID, task.ID, "warn", "任务已取消，丢弃生成结果", "")
+				return nil
+			}
+		}
 		task.Status = model.TaskStatusFailed
 		task.Stage = "任务结果保存失败"
 		task.Error = taskFailureMessage(err)
 		task.CompletedAt = ptr(time.Now())
-		_ = s.repo.Save(task)
+		_, _ = s.repo.UpdateTaskTerminalState(task.ID, model.TaskStatusRunning, task.Status, task.Stage, task.Error, *task.CompletedAt)
 		if compactErr := s.finalizeTaskTextReplay(task.ID, model.TaskStatusFailed); compactErr != nil {
 			_ = s.log(task.UserID, task.ID, "error", "文本回放草稿归并失败", compactErr.Error())
 		}
@@ -1898,10 +1942,10 @@ func shotDescription(shot agentStoryboardShot) string {
 func storyboardImagePromptValues(projectStyle string, styleGuide string, shot agentStoryboardShot) map[string]string {
 	negative := defaultString(strings.TrimSpace(shot.Negative), "禁止换脸、服装变化、手部畸形、乱码、风格突变和塑料材质")
 	return map[string]string{
-		"项目视觉": storyboardProjectVisualSummary(projectStyle, styleGuide),
-		"首帧构图": compactPromptText(shot.VisualPrompt+"；光影："+shot.Lighting, 360),
+		"项目视觉":   storyboardProjectVisualSummary(projectStyle, styleGuide),
+		"首帧构图":   compactPromptText(shot.VisualPrompt+"；光影："+shot.Lighting, 360),
 		"表演起始状态": compactPromptText(shot.Performance, 180),
-		"负面要求": compactPromptText(negative, 140),
+		"负面要求":   compactPromptText(negative, 140),
 	}
 }
 
@@ -1922,15 +1966,15 @@ func storyboardVideoPromptValues(projectStyle string, styleGuide string, shot ag
 	timeBeats := defaultString(strings.TrimSpace(shot.TimeBeats), fmt.Sprintf("0-%d秒：%s", shot.Duration, strings.TrimSpace(shot.Description)))
 	negative := defaultString(strings.TrimSpace(shot.Negative), "禁止换脸、服装变化、手部畸形、乱码、闪烁、风格突变和动作僵硬")
 	values := map[string]string{
-		"项目视觉": storyboardProjectVisualSummary(projectStyle, styleGuide),
-		"镜头意图": compactPromptText(shot.Intent+"；观众视点："+shot.ViewerPOV+"；情绪："+shot.Emotion, 150),
-		"首帧构图": compactPromptText(shot.VisualPrompt+"；光影："+shot.Lighting, 280),
+		"项目视觉":  storyboardProjectVisualSummary(projectStyle, styleGuide),
+		"镜头意图":  compactPromptText(shot.Intent+"；观众视点："+shot.ViewerPOV+"；情绪："+shot.Emotion, 150),
+		"首帧构图":  compactPromptText(shot.VisualPrompt+"；光影："+shot.Lighting, 280),
 		"表演与调度": compactPromptText(shot.Performance, 180),
-		"摄影机": compactPromptText(strings.TrimSpace(shot.ShotSize)+"；"+camera+"；主运镜："+motion, 220),
-		"时间节拍": compactPromptText(timeBeats, 240),
+		"摄影机":   compactPromptText(strings.TrimSpace(shot.ShotSize)+"；"+camera+"；主运镜："+motion, 220),
+		"时间节拍":  compactPromptText(timeBeats, 240),
 		"运动与结尾": compactPromptText(shot.VideoPrompt+"；连续性结尾："+shot.ContinuityOut, 240),
-		"声音": compactPromptText(strings.TrimSpace(shot.Dialogue)+"；音效："+strings.TrimSpace(shot.AudioEffects), 160),
-		"负面要求": compactPromptText(negative, 160),
+		"声音":    compactPromptText(strings.TrimSpace(shot.Dialogue)+"；音效："+strings.TrimSpace(shot.AudioEffects), 160),
+		"负面要求":  compactPromptText(negative, 160),
 	}
 	if len(shot.MustHave) > 0 {
 		priority := "必须完成：" + strings.Join(shot.MustHave, "；")
@@ -2080,65 +2124,6 @@ func (s *Service) markSessionFailed(task model.Task, message string) error {
 	}
 	return s.repo.Create(&model.Message{ID: newID(), UserID: task.UserID, SessionID: task.SessionID, Role: "assistant", Content: defaultString(message, "会话任务失败。")})
 }
-
-func buildAgentResult(task model.Task) (map[string]any, []map[string]any) {
-	title := strings.TrimSpace(task.Prompt)
-	if len([]rune(title)) > 28 {
-		title = string([]rune(title)[:28]) + "..."
-	}
-	result := map[string]any{
-		"taskId":    task.ID,
-		"operation": task.Operation,
-		"provider":  defaultString(task.Provider, "internal-agent"),
-		"model":     defaultString(task.Model, "workflow-router"),
-		"plan": []map[string]any{
-			{"kind": "script", "title": "创意脚本", "content": task.Prompt},
-			{"kind": "scene", "title": "主场景", "content": "根据用户输入拆解为可生成的视频场景。"},
-			{"kind": "shot", "title": "镜头 1", "content": "建立画面、主体、风格和运镜。"},
-			{"kind": "final", "title": "成片", "content": "等待视频生成 Provider 回填成片结果。"},
-		},
-	}
-	ops := []map[string]any{
-		nodeOp("script-"+task.ID, "text", "剧本 · "+title, 0, 0, "script", task.Prompt),
-		nodeOp("scene-"+task.ID, "text", "场景 · 主场景", 380, 0, "scene", "主场景设定、角色关系、视觉风格。"),
-		nodeOpWithMetadata("shot-"+task.ID, "video", "分镜 · 镜头 1", 760, 0, map[string]any{"workflowKind": "shot", "status": "idle", "generationMode": "video", "prompt": task.Prompt, "composerContent": task.Prompt, "videoEditOperation": "text_to_video"}),
-		nodeOp("final-"+task.ID, "video", "成片 · 待生成", 1140, 0, "final", ""),
-		connectOp("script-"+task.ID, "scene-"+task.ID),
-		connectOp("scene-"+task.ID, "shot-"+task.ID),
-		connectOp("shot-"+task.ID, "final-"+task.ID),
-	}
-	return result, ops
-}
-
-func buildVideoWorkflowResult(task model.Task) (map[string]any, []map[string]any) {
-	title := strings.TrimSpace(task.Prompt)
-	if len([]rune(title)) > 28 {
-		title = string([]rune(title)[:28]) + "..."
-	}
-	operation := defaultString(task.Operation, strings.TrimPrefix(task.Type, "video_"))
-	result := map[string]any{
-		"taskId":    task.ID,
-		"operation": operation,
-		"provider":  defaultString(task.Provider, "internal-agent"),
-		"model":     defaultString(task.Model, "workflow-router"),
-		"plan": []map[string]any{
-			{"kind": "reference_set", "title": "参考素材组", "content": "收集原视频、参考图、参考音频和版本样片。"},
-			{"kind": "shot", "title": "编辑镜头", "content": task.Prompt},
-			{"kind": "final", "title": "结果版本", "content": "等待 provider 生成或人工确认后回填版本结果。"},
-		},
-	}
-	ops := []map[string]any{
-		nodeOp("video-brief-"+task.ID, "text", "编辑需求 · "+title, 0, 0, "script", task.Prompt),
-		nodeOpWithMetadata("video-ref-"+task.ID, "text", "参考素材组", 380, 0, map[string]any{"workflowKind": "reference_set", "status": "idle", "content": "原片、参考图、参考音频、风格板或历史版本。", "videoEditOperation": operation}),
-		nodeOpWithMetadata("video-shot-"+task.ID, "video", "视频任务 · "+operation, 760, 0, map[string]any{"workflowKind": "shot", "status": "idle", "generationMode": "video", "prompt": task.Prompt, "composerContent": task.Prompt, "videoEditOperation": operation}),
-		nodeOpWithMetadata("video-result-"+task.ID, "video", "结果版本 · 待回填", 1140, 0, map[string]any{"workflowKind": "final", "status": "idle", "videoEditOperation": operation, "versionLabel": "v1"}),
-		connectOp("video-brief-"+task.ID, "video-ref-"+task.ID),
-		connectOp("video-ref-"+task.ID, "video-shot-"+task.ID),
-		connectOp("video-shot-"+task.ID, "video-result-"+task.ID),
-	}
-	return result, ops
-}
-
 func nodeOp(id string, nodeType string, title string, x int, y int, workflowKind string, content string) map[string]any {
 	return nodeOpWithMetadata(id, nodeType, title, x, y, map[string]any{"content": content, "workflowKind": workflowKind, "status": "idle"})
 }
