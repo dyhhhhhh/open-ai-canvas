@@ -134,7 +134,7 @@ func volcenginePlanTTSJSONChunk(payload []byte) ([]byte, error) {
 	if err := json.Unmarshal(payload, &response); err != nil {
 		return nil, err
 	}
-	if response.Code != 0 {
+	if response.Code != 0 && response.Code != 20000000 {
 		return nil, fmt.Errorf("火山 Agent Plan 语音合成失败：%s", defaultString(response.Message, "上游返回错误"))
 	}
 	if strings.TrimSpace(response.Data) == "" {
