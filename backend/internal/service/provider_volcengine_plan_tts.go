@@ -45,16 +45,13 @@ func runVolcenginePlanTTSTask(ctx context.Context, input canvasGenerationInput) 
 			},
 		},
 	}
-	var response volcenginePlanTTSResponse
-	if err := postVolcenginePlanTTS(ctx, input.Config, resourceID, requestID, body, &response); err != nil {
+	payload, err := postVolcenginePlanTTS(ctx, input.Config, resourceID, requestID, body)
+	if err != nil {
 		return nil, err
 	}
-	if response.Code != 0 {
-		return nil, fmt.Errorf("火山 Agent Plan 语音合成失败：%s", defaultString(response.Message, "上游返回错误"))
-	}
-	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(response.Data))
+	data, err := volcenginePlanTTSAudioData(payload)
 	if err != nil {
-		return nil, errors.New("火山 Agent Plan 返回的音频数据无效")
+		return nil, err
 	}
 	mimeType, err := validateGeneratedAudio("", data, format)
 	if err != nil {
@@ -63,14 +60,14 @@ func runVolcenginePlanTTSTask(ctx context.Context, input canvasGenerationInput) 
 	return map[string]interface{}{"mode": "audio", "audio": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType, "format": format}}, nil
 }
 
-func postVolcenginePlanTTS(ctx context.Context, config providerConfig, resourceID string, requestID string, body interface{}, target interface{}) error {
+func postVolcenginePlanTTS(ctx context.Context, config providerConfig, resourceID string, requestID string, body interface{}) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, volcenginePlanTTSURL(config.BaseURL), bytes.NewReader(data))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", config.APIKey)
@@ -78,7 +75,33 @@ func postVolcenginePlanTTS(ctx context.Context, config providerConfig, resourceI
 	req.Header.Set("X-Api-Request-Id", requestID)
 	req.Header.Set("X-Api-Sequence", "1")
 	ApplyOutboundHeaders(req, config.Headers)
-	return doJSON(req, target)
+	payload, _, err := doBinary(req)
+	return payload, err
+}
+
+func volcenginePlanTTSAudioData(payload []byte) ([]byte, error) {
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 {
+		return nil, errors.New("火山 Agent Plan 返回的音频数据为空")
+	}
+	if json.Valid(payload) {
+		var response volcenginePlanTTSResponse
+		if err := json.Unmarshal(payload, &response); err != nil {
+			return nil, err
+		}
+		if response.Code != 0 {
+			return nil, fmt.Errorf("火山 Agent Plan 语音合成失败：%s", defaultString(response.Message, "上游返回错误"))
+		}
+		data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(response.Data))
+		if err != nil {
+			return nil, errors.New("火山 Agent Plan 返回的音频数据无效")
+		}
+		return data, nil
+	}
+	if data, err := base64.StdEncoding.DecodeString(string(payload)); err == nil {
+		return data, nil
+	}
+	return payload, nil
 }
 
 func volcenginePlanTTSURL(baseURL string) string {
