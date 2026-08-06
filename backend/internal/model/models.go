@@ -790,6 +790,10 @@ type TaskTextDelta struct {
 	ExpiresAt time.Time `json:"expiresAt" gorm:"index"`
 }
 
+func (TaskTextDelta) TableName() string {
+	return "task_text_deltas"
+}
+
 type Session struct {
 	ID                 string        `json:"id" gorm:"primaryKey;size:36"`
 	UserID             string        `json:"userId" gorm:"index;size:36"`
