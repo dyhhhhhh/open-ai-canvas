@@ -82,7 +82,7 @@ func TestVolcenginePlanTTSAudioDataAcceptsPlainBase64(t *testing.T) {
 func TestVolcenginePlanTTSAudioDataConcatenatesNDJSONChunks(t *testing.T) {
 	first := base64.StdEncoding.EncodeToString([]byte("ID3first"))
 	second := base64.StdEncoding.EncodeToString([]byte("-second"))
-	payload := []byte(`{"code":0,"data":"` + first + `"}` + "\n" + `{"code":0,"data":"` + second + `"}`)
+	payload := []byte(`{"code":20000000,"data":"` + first + `"}` + "\n" + `{"code":20000000,"data":"` + second + `"}`)
 	data, err := volcenginePlanTTSAudioData(payload)
 	if err != nil {
 		t.Fatalf("volcenginePlanTTSAudioData() error = %v", err)
