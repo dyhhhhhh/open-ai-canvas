@@ -555,6 +555,43 @@ func TestRunVideoTaskUsesXAIVideoGenerationEndpoint(t *testing.T) {
 	}
 }
 
+func TestRunVideoTaskFallsBackToGrokContentEndpoint(t *testing.T) {
+	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
+	paths := make([]string, 0, 3)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v1/videos/generations":
+			_, _ = w.Write([]byte(`{"request_id":"video-local"}`))
+		case "GET /v1/videos/video-local":
+			_, _ = w.Write([]byte(`{"status":"done","video":{"url":"http://127.0.0.1:1/files/video.mp4"}}`))
+		case "GET /v1/videos/video-local/content":
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write([]byte("video"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := runVideoTask(context.Background(), canvasGenerationInput{
+		Prompt: "make it move",
+		Config: providerConfig{BaseURL: server.URL + "/v1", APIKey: "test-key", Model: "grok-imagine-video", InterfaceType: "xai-video"},
+	})
+	if err != nil {
+		t.Fatalf("runVideoTask() error = %v", err)
+	}
+	video, ok := result["video"].(map[string]interface{})
+	if !ok || video["dataUrl"] != "data:video/mp4;base64,dmlkZW8=" {
+		t.Fatalf("video = %#v", result["video"])
+	}
+	want := "POST /v1/videos/generations,GET /v1/videos/video-local,GET /v1/videos/video-local/content"
+	if got := strings.Join(paths, ","); got != want {
+		t.Fatalf("paths = %q, want %q", got, want)
+	}
+}
+
 func TestXAIVideoBodyUsesOfficialImageShapeAndNormalizesSettings(t *testing.T) {
 	body, err := grokVideoBody(canvasGenerationInput{
 		Prompt: "make it move",

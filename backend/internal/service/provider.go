@@ -1285,11 +1285,21 @@ func runVideoTask(ctx context.Context, input canvasGenerationInput) (map[string]
 		if status == "completed" || status == "succeeded" || status == "success" || status == "done" {
 			if videoURL := newAPIVideoResultURL(state); videoURL != "" {
 				data, mimeType, err := getExternalBinary(withProviderRequestKind(ctx, "download"), videoURL)
-				if err != nil {
-					return nil, fmt.Errorf("视频结果下载失败（任务 %s）：%w", id, err)
+				if err == nil {
+					mimeType = normalizedMediaMimeType(mimeType, data)
+					return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType}}, nil
 				}
-				mimeType = normalizedMediaMimeType(mimeType, data)
-				return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType}}, nil
+				// Grok2API may return a localhost result URL. Use its authenticated
+				// content endpoint instead of weakening outbound SSRF protection.
+				if input.Config.InterfaceType == string(model.ChannelInterfaceXAIVideo) || isGrokVideoConfig(input.Config) {
+					content, contentMimeType, contentErr := getBinary(ctx, input.Config, "/videos/"+url.PathEscape(id)+"/content")
+					if contentErr == nil {
+						contentMimeType = normalizedMediaMimeType(contentMimeType, content)
+						return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(contentMimeType, content), "mimeType": contentMimeType}}, nil
+					}
+					return nil, fmt.Errorf("视频结果下载失败（任务 %s）：%w；内容接口回退失败：%v", id, err, contentErr)
+				}
+				return nil, fmt.Errorf("视频结果下载失败（任务 %s）：%w", id, err)
 			}
 			data, mimeType, err := getBinary(ctx, input.Config, "/videos/"+id+"/content")
 			if err != nil {
