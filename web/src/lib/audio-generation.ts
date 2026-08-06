@@ -1,4 +1,5 @@
 export const audioVoiceOptions = [
+    { value: "zh_female_vv_uranus_bigtts", label: "豆包 TTS 2.0 · 中文女声" },
     { value: "alloy", label: "Alloy" },
     { value: "ash", label: "Ash" },
     { value: "ballad", label: "Ballad" },
