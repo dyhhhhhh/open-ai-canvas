@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -85,23 +86,65 @@ func volcenginePlanTTSAudioData(payload []byte) ([]byte, error) {
 		return nil, errors.New("火山 Agent Plan 返回的音频数据为空")
 	}
 	if json.Valid(payload) {
-		var response volcenginePlanTTSResponse
-		if err := json.Unmarshal(payload, &response); err != nil {
-			return nil, err
-		}
-		if response.Code != 0 {
-			return nil, fmt.Errorf("火山 Agent Plan 语音合成失败：%s", defaultString(response.Message, "上游返回错误"))
-		}
-		data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(response.Data))
-		if err != nil {
-			return nil, errors.New("火山 Agent Plan 返回的音频数据无效")
-		}
-		return data, nil
+		return volcenginePlanTTSJSONChunk(payload)
+	}
+	if data, ok, err := volcenginePlanTTSNDJSONAudio(payload); ok {
+		return data, err
 	}
 	if data, err := base64.StdEncoding.DecodeString(string(payload)); err == nil {
 		return data, nil
 	}
 	return payload, nil
+}
+
+func volcenginePlanTTSNDJSONAudio(payload []byte) ([]byte, bool, error) {
+	var audio bytes.Buffer
+	scanner := bufio.NewScanner(bytes.NewReader(payload))
+	scanner.Buffer(make([]byte, 0, 64<<10), int(maxProviderResponseBytes))
+	found := false
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		if !json.Valid(line) {
+			return nil, false, nil
+		}
+		found = true
+		chunk, err := volcenginePlanTTSJSONChunk(line)
+		if err != nil {
+			return nil, true, err
+		}
+		_, _ = audio.Write(chunk)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, true, err
+	}
+	if !found {
+		return nil, false, nil
+	}
+	if audio.Len() == 0 {
+		return nil, true, errors.New("火山 Agent Plan 返回的音频数据为空")
+	}
+	return audio.Bytes(), true, nil
+}
+
+func volcenginePlanTTSJSONChunk(payload []byte) ([]byte, error) {
+	var response volcenginePlanTTSResponse
+	if err := json.Unmarshal(payload, &response); err != nil {
+		return nil, err
+	}
+	if response.Code != 0 {
+		return nil, fmt.Errorf("火山 Agent Plan 语音合成失败：%s", defaultString(response.Message, "上游返回错误"))
+	}
+	if strings.TrimSpace(response.Data) == "" {
+		return nil, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(response.Data))
+	if err != nil {
+		return nil, errors.New("火山 Agent Plan 返回的音频数据无效")
+	}
+	return data, nil
 }
 
 func volcenginePlanTTSURL(baseURL string) string {
