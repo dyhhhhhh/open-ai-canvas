@@ -68,3 +68,13 @@ func TestVolcenginePlanTTSSpeedAndURL(t *testing.T) {
 		t.Fatalf("Ark Plan URL = %q", got)
 	}
 }
+
+func TestVolcenginePlanTTSAudioDataAcceptsPlainBase64(t *testing.T) {
+	data, err := volcenginePlanTTSAudioData([]byte(base64.StdEncoding.EncodeToString([]byte("ID3test-mp3"))))
+	if err != nil {
+		t.Fatalf("volcenginePlanTTSAudioData() error = %v", err)
+	}
+	if string(data) != "ID3test-mp3" {
+		t.Fatalf("data = %q", data)
+	}
+}
