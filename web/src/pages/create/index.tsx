@@ -880,6 +880,8 @@ function migrateCreationConversations(conversations: CreationConversation[]) {
         ...conversation,
         messages: conversation.messages.map((message) => message.role === "assistant" && message.status === "streaming" && !(message.taskIds?.length || message.submissionIds?.length)
             ? { ...message, status: "draft" as const }
+            : message.role === "assistant" && message.status === "error" && message.error === "任务已结束，但生成结果暂时无法读取" && Boolean(message.taskIds?.length)
+                ? { ...message, status: "pending" as const }
             : message),
     }));
 }
@@ -993,7 +995,7 @@ type PersistedCreationTask = GenerationTask & { creationResultUrls?: string[]; c
 
 async function persistCreationTaskResults(tasks: GenerationTask[]): Promise<PersistedCreationTask[]> {
     return Promise.all(tasks.map(async (task): Promise<PersistedCreationTask> => {
-        if (task.status !== "succeeded" || !task.clientContext) return task;
+        if (task.status !== "succeeded") return task;
         try {
             const result = task.resultJson ? parseBackendGenerationResult(task) : null;
             const images = result?.images?.length ? result.images : task.previewUrl && task.previewKind !== "video" ? [{ dataUrl: task.previewUrl }] : [];

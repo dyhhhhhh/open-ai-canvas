@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,6 +18,18 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
+
+var testGeneratedPNG = []byte{
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+	0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+	0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41,
+	0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+	0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99,
+	0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+	0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+}
 
 func TestSignedOSSObjectURLUsesExpiringQuerySignature(t *testing.T) {
 	expiresAt := time.Unix(1800000000, 0)
@@ -285,5 +299,67 @@ func TestPersistGeneratedMediaAppliesStoredFileQuota(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "2GB 上限") {
 		t.Fatalf("persistGeneratedMediaResult() error = %v", err)
+	}
+}
+
+func TestPersistGeneratedRemoteImageURLStoresOwnedResource(t *testing.T) {
+	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(testGeneratedPNG)
+	}))
+	defer upstream.Close()
+	svc := newResourceTestService(t)
+	result, err := svc.persistGeneratedMediaResult("user-1", map[string]interface{}{
+		"images": []interface{}{map[string]interface{}{"providerImageURL": upstream.URL + "/temporary.png"}},
+	})
+	if err != nil {
+		t.Fatalf("persistGeneratedMediaResult() error = %v", err)
+	}
+	image := result["images"].([]interface{})[0].(map[string]interface{})
+	if _, found := image["providerImageURL"]; found {
+		t.Fatalf("provider image URL leaked into persisted result: %#v", image)
+	}
+	resourceID, _ := image["resourceId"].(string)
+	if resourceID == "" || image["url"] != "/api/resources/"+resourceID+"/file" {
+		t.Fatalf("persisted image = %#v", image)
+	}
+	resource, body, err := svc.OpenResource("user-1", resourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	stored, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resource.Kind != "image" || resource.MimeType != "image/png" || !bytes.Equal(stored, testGeneratedPNG) {
+		t.Fatalf("stored resource = %#v, bytes = %d", resource, len(stored))
+	}
+}
+
+func TestPersistGeneratedRemoteImageURLRejectsNonImage(t *testing.T) {
+	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("not an image"))
+	}))
+	defer upstream.Close()
+	svc := newResourceTestService(t)
+	_, err := svc.persistGeneratedMediaResult("user-1", map[string]interface{}{
+		"images": []interface{}{map[string]interface{}{"providerImageURL": upstream.URL}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "不是图片资源") {
+		t.Fatalf("persistGeneratedMediaResult() error = %v", err)
+	}
+}
+
+func TestImageDataURLsMarksTemporaryProviderURLs(t *testing.T) {
+	images, err := imageDataURLs(imageResponse{Data: []map[string]interface{}{{"url": "https://example.com/temporary.png"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 1 || images[0]["providerImageURL"] != "https://example.com/temporary.png" || images[0]["dataUrl"] != "" {
+		t.Fatalf("images = %#v", images)
 	}
 }

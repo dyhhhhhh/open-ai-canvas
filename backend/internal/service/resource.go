@@ -438,6 +438,10 @@ func (s *Service) persistGeneratedMediaValueMode(userID string, value interface{
 				item["width"] = resource.Width
 				item["height"] = resource.Height
 			}
+		} else if rawURL := providerGeneratedImageURL(item); rawURL != "" {
+			if err := s.persistGeneratedRemoteImage(userID, item, rawURL, enforceQuota); err != nil {
+				return nil, err
+			}
 		}
 		for key, child := range item {
 			stored, err := s.persistGeneratedMediaValueMode(userID, child, skipInvalidDataURL, enforceQuota)
@@ -450,6 +454,55 @@ func (s *Service) persistGeneratedMediaValueMode(userID string, value interface{
 	default:
 		return value, nil
 	}
+}
+
+func providerGeneratedImageURL(item map[string]interface{}) string {
+	value, _ := item["providerImageURL"].(string)
+	return strings.TrimSpace(value)
+}
+
+func (s *Service) persistGeneratedRemoteImage(userID string, item map[string]interface{}, rawURL string, enforceQuota bool) error {
+	policy, err := s.RuntimePolicy()
+	if err != nil {
+		return err
+	}
+	payload, err := downloadRemoteResource(rawURL, megabytes(policy.Resource.GeneratedFileMB)+1)
+	if err != nil {
+		return fmt.Errorf("生成图片下载失败：%w", err)
+	}
+	if !strings.HasPrefix(strings.ToLower(payload.mimeType), "image/") {
+		return errors.New("生成图片下载结果不是图片资源")
+	}
+	width, height := imageDimensions(payload.data)
+	size := int64(len(payload.data))
+	quotaDay := ""
+	if enforceQuota {
+		quotaDay, err = s.reserveGeneratedResourceQuota(userID, size)
+		if err != nil {
+			return err
+		}
+	}
+	resource, err := s.storeResource(userID, "image", "generated."+extensionFromMimeType(payload.mimeType), payload.mimeType, size, width, height, 0, bytes.NewReader(payload.data))
+	if err != nil {
+		if enforceQuota {
+			s.releaseUserUploadQuota(userID, quotaDay, size)
+		}
+		return fmt.Errorf("生成内容写入资源存储失败：%w", err)
+	}
+	if enforceQuota {
+		s.commitUserUploadQuota(userID, size)
+	}
+	delete(item, "providerImageURL")
+	resourceURL := "/api/resources/" + resource.ID + "/file"
+	item["dataUrl"] = resourceURL
+	item["url"] = resourceURL
+	item["storageKey"] = "resource:" + resource.ID
+	item["resourceId"] = resource.ID
+	item["bytes"] = resource.Size
+	item["mimeType"] = resource.MimeType
+	item["width"] = resource.Width
+	item["height"] = resource.Height
+	return nil
 }
 
 func inlineMediaValue(item map[string]interface{}) string {

@@ -12,9 +12,40 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"infinite-canvas/backend/internal/model"
 )
 
 const testReferenceImageDataURL = "data:image/png;base64,aGVsbG8="
+
+func TestResolveProviderConfigDecryptsSystemChannelCredentials(t *testing.T) {
+	svc, db := newChannelModelTestService(t)
+	svc.dataDir = t.TempDir()
+	channel := model.ModelChannel{
+		ID: "system-channel", UserID: "admin", Scope: model.ChannelScopeSystem, Enabled: true,
+		Name: "System", BaseURL: "https://example.test/v1", APIKey: "plain-api-key", APIFormat: "openai", ModelsJSON: `["image-model"]`,
+	}
+	if err := svc.encryptSystemChannelSecrets(&channel); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&channel).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.ChannelModel{
+		ID: "image-model", ChannelID: channel.ID, ModelKey: "image-model", Capability: "image",
+		Protocol: model.ChannelInterfaceVolcengineArkImage, Enabled: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	config, err := svc.resolveProviderConfig(providerConfig{ChannelID: channel.ID, Model: "image-model"})
+	if err != nil {
+		t.Fatalf("resolveProviderConfig() error = %v", err)
+	}
+	if config.APIKey != "plain-api-key" {
+		t.Fatalf("APIKey = %q, want decrypted system key", config.APIKey)
+	}
+}
 
 func TestWriteMediaPartSanitizesFilenameAndSetsMimeType(t *testing.T) {
 	var body bytes.Buffer
@@ -100,6 +131,26 @@ func TestNormalizeVolcengineArkImageSizeUpscalesToProviderMinimum(t *testing.T) 
 	}
 }
 
+func TestNormalizeVolcengineArkImageSizePreservesAspectRatioAtProviderMinimum(t *testing.T) {
+	size := normalizeVolcengineArkImageSize("1024x1536")
+	parts := strings.Split(size, "x")
+	if len(parts) != 2 {
+		t.Fatalf("normalized size = %q", size)
+	}
+	width, widthErr := strconv.Atoi(parts[0])
+	height, heightErr := strconv.Atoi(parts[1])
+	if widthErr != nil || heightErr != nil {
+		t.Fatalf("normalized size = %q", size)
+	}
+	pixels := int64(width) * int64(height)
+	if pixels < volcengineArkImageMinPixels || pixels > volcengineArkImageMaxPixels {
+		t.Fatalf("normalized size = %q (%d pixels), outside provider limits", size, pixels)
+	}
+	if height != width*3/2 {
+		t.Fatalf("normalized size = %q, want 2:3 aspect ratio", size)
+	}
+}
+
 func TestVolcengineArkImageRejectsMaskBeforeRequest(t *testing.T) {
 	_, err := runImageTask(context.Background(), canvasGenerationInput{
 		Prompt: "edit only the masked area",
@@ -108,6 +159,31 @@ func TestVolcengineArkImageRejectsMaskBeforeRequest(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "不支持蒙版") {
 		t.Fatalf("runImageTask() error = %v", err)
+	}
+}
+
+func TestXAIImageBodyUsesAspectRatioInsteadOfPixelSize(t *testing.T) {
+	body := xaiImageBody(canvasGenerationInput{
+		Prompt: "rainy apartment building",
+		Config: providerConfig{Model: "grok-imagine-image", Size: "9:16", Quality: "2k"},
+	})
+	if got, _ := body["aspect_ratio"].(string); got != "9:16" {
+		t.Fatalf("aspect_ratio = %q, want 9:16", got)
+	}
+	if _, exists := body["size"]; exists {
+		t.Fatalf("xAI image body must not include size: %#v", body)
+	}
+	if _, exists := body["resolution"]; exists {
+		t.Fatalf("xAI image body must leave resolution to the upstream: %#v", body)
+	}
+	if _, exists := body["quality"]; exists {
+		t.Fatalf("xAI image body must not include quality: %#v", body)
+	}
+}
+
+func TestNormalizeXAIImageAspectRatioConvertsPixelSize(t *testing.T) {
+	if got := normalizeXAIImageAspectRatio("1024x1824"); got != "9:16" {
+		t.Fatalf("normalizeXAIImageAspectRatio() = %q, want 9:16", got)
 	}
 }
 
@@ -514,7 +590,7 @@ func TestRunVideoTaskUsesXAIVideoGenerationEndpoint(t *testing.T) {
 				}
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"request_id":"video-1"}`))
+			_, _ = w.Write([]byte(`{"id":"internal-request-id","request_id":"video-1"}`))
 		case "GET /v1/videos/video-1":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"done","video":{"url":"` + server.URL + `/files/video.mp4"}}`))
@@ -550,6 +626,43 @@ func TestRunVideoTaskUsesXAIVideoGenerationEndpoint(t *testing.T) {
 		t.Fatalf("video = %#v", result["video"])
 	}
 	want := "POST /v1/videos/generations,GET /v1/videos/video-1,GET /files/video.mp4"
+	if got := strings.Join(paths, ","); got != want {
+		t.Fatalf("paths = %q, want %q", got, want)
+	}
+}
+
+func TestQueryXAIVideoTaskRecoversExistingRequest(t *testing.T) {
+	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
+	paths := make([]string, 0, 2)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/videos/video-request":
+			_, _ = w.Write([]byte(`{"status":"done","video":{"url":"` + server.URL + `/files/video.mp4"}}`))
+		case "GET /files/video.mp4":
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write([]byte("video"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, status, err := queryXAIVideoTask(context.Background(), canvasGenerationInput{
+		Config: providerConfig{BaseURL: server.URL + "/v1", APIKey: "test-key", InterfaceType: "xai-video"},
+	}, "video-request")
+	if err != nil {
+		t.Fatalf("queryXAIVideoTask() error = %v", err)
+	}
+	if status != "done" {
+		t.Fatalf("status = %q, want done", status)
+	}
+	video, ok := result["video"].(map[string]interface{})
+	if !ok || video["dataUrl"] != "data:video/mp4;base64,dmlkZW8=" {
+		t.Fatalf("video = %#v", result["video"])
+	}
+	want := "GET /v1/videos/video-request,GET /files/video.mp4"
 	if got := strings.Join(paths, ","); got != want {
 		t.Fatalf("paths = %q, want %q", got, want)
 	}

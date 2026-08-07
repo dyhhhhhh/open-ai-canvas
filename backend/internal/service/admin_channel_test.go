@@ -42,6 +42,40 @@ func TestChannelFromRequestStoresConnectionWithoutDefaultProtocol(t *testing.T) 
 	}
 }
 
+func TestEnsureSystemChannelModelsBackfillsLegacyVideoCapabilities(t *testing.T) {
+	svc, db := newChannelModelTestService(t)
+	channel := model.ModelChannel{ID: "channel-legacy", UserID: "admin", Scope: model.ChannelScopeSystem, Enabled: true, Name: "Legacy", ModelsJSON: `[]`}
+	legacyVideo := model.ChannelModel{ID: "video-legacy", ChannelID: channel.ID, ModelKey: "grok-imagine-video", Capability: "video", Protocol: model.ChannelInterfaceXAIVideo, Enabled: true}
+	textModel := model.ChannelModel{ID: "text-current", ChannelID: channel.ID, ModelKey: "text-model", Capability: "text", Protocol: model.ChannelInterfaceOpenAIResponse, Enabled: true}
+	if err := db.Create(&channel).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&[]model.ChannelModel{legacyVideo, textModel}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.EnsureSystemChannelModels(); err != nil {
+		t.Fatalf("EnsureSystemChannelModels() error = %v", err)
+	}
+	var updatedVideo, unchangedText model.ChannelModel
+	if err := db.First(&updatedVideo, "id = ?", legacyVideo.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&unchangedText, "id = ?", textModel.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	capability, err := DecodeModelCapabilityConfig(updatedVideo.CapabilityConfigJSON)
+	if err != nil || capability == nil || capability.Video == nil {
+		t.Fatalf("legacy video capability = %#v, error = %v", capability, err)
+	}
+	if capability.Video.Duration.Min != 1 || capability.Video.Duration.Max != 15 || updatedVideo.CapabilityVersion != 1 {
+		t.Fatalf("legacy video capability = %#v, version = %d", capability.Video, updatedVideo.CapabilityVersion)
+	}
+	if unchangedText.CapabilityConfigJSON != "" {
+		t.Fatalf("text model capability config = %q, want empty", unchangedText.CapabilityConfigJSON)
+	}
+}
+
 func TestSystemChannelSecretsAreEncryptedAtRest(t *testing.T) {
 	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))

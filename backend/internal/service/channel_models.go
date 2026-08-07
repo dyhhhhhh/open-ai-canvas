@@ -52,6 +52,26 @@ func (s *Service) EnsureSystemChannelModels() error {
 			if err := s.syncInitialChannelModels(&channels[index], channelModelNames(channels[index])); err != nil {
 				return err
 			}
+			items, err = s.repo.ChannelModels(channels[index].ID, true)
+			if err != nil {
+				return err
+			}
+		}
+		for itemIndex := range items {
+			item := &items[itemIndex]
+			if item.Capability != "video" || item.Protocol == "" || strings.TrimSpace(item.CapabilityConfigJSON) != "" {
+				continue
+			}
+			capabilityConfig := DefaultModelCapabilityConfig(string(item.Protocol))
+			encoded, err := json.Marshal(capabilityConfig)
+			if err != nil {
+				return err
+			}
+			item.CapabilityConfigJSON = string(encoded)
+			item.CapabilityVersion++
+			if err := s.repo.SaveChannelModel(item); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -451,7 +471,7 @@ func (s *Service) syncChannelModelNames(channel *model.ModelChannel) error {
 
 func capabilityForProtocol(protocol model.ChannelInterfaceType) string {
 	switch protocol {
-	case model.ChannelInterfaceOpenAIImage, model.ChannelInterfaceVolcengineArkImage, model.ChannelInterfaceVolcengineJiMengImage:
+	case model.ChannelInterfaceOpenAIImage, model.ChannelInterfaceXAIImage, model.ChannelInterfaceVolcengineArkImage, model.ChannelInterfaceVolcengineJiMengImage:
 		return "image"
 	case model.ChannelInterfaceOpenAIAudio, model.ChannelInterfaceAsyncAudio, model.ChannelInterfaceVolcenginePlanTTS:
 		return "audio"

@@ -28,6 +28,7 @@ export function generationErrorMessage(error: unknown) {
     const providerMessage = extractStructuredProviderMessage(raw) || extractWrappedProviderMessage(raw);
     const displayMessage = providerMessage || raw;
     if (isContentModerationError(displayMessage)) return CONTENT_MODERATION_MESSAGE;
+    if (isGrokVideoUpstreamFailure(displayMessage)) return "Grok 视频上游服务暂时不可用，请稍后重试。";
     if (isNetworkFailure(displayMessage)) return NETWORK_ERROR_MESSAGE;
     if (!providerMessage) {
         if (hasHttpStatus(raw, 429)) return "服务当前繁忙，请稍后重试。";
@@ -107,6 +108,10 @@ function providerPayloadMessage(payload: unknown): string {
 
 function isNetworkFailure(value: string) {
     return /\b(?:dial tcp|connection refused|connection reset|no such host|i\/o timeout|context deadline exceeded|network error|failed to fetch|fetch failed|socket hang up|econnrefused|econnreset|etimedout)\b/i.test(value);
+}
+
+function isGrokVideoUpstreamFailure(value: string) {
+    return /console\.x\.ai.*unexpected EOF/i.test(value);
 }
 
 function hasHttpStatus(value: string, ...statuses: number[]) {

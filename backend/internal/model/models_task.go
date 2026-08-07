@@ -5,6 +5,7 @@ import "time"
 type Task struct {
 	ID                        string               `json:"id" gorm:"primaryKey;size:36"`
 	UserID                    string               `json:"userId" gorm:"index;size:36;index:idx_tasks_user_created,priority:1"`
+	SubmissionID              string               `json:"submissionId,omitempty" gorm:"size:96"`
 	SessionID                 string               `json:"sessionId" gorm:"index;size:36"`
 	ProjectID                 string               `json:"projectId" gorm:"index;size:80"`
 	Type                      string               `json:"type" gorm:"index;size:64"`
@@ -41,13 +42,24 @@ type Task struct {
 // TaskTextDelta 只保存可回放窗口内的文本增量；最终正文和失败草稿分别归并到 Task.ResultJSON 与 Task.TextDraft。
 type TaskTextDelta struct {
 	ID        string    `json:"id" gorm:"primaryKey;size:36"`
-	UserID    string    `json:"userId" gorm:"index;size:36;index:idx_task_text_deltas_user_created,priority:1"`
-	TaskID    string    `json:"taskId" gorm:"index;size:36;uniqueIndex:idx_task_text_deltas_sequence,priority:1"`
-	Sequence  int64     `json:"sequence" gorm:"uniqueIndex:idx_task_text_deltas_sequence,priority:2"`
+	UserID    string    `json:"userId" gorm:"index;size:36;index:idx_task_text_delta_window,priority:1"`
+	TaskID    string    `json:"taskId" gorm:"index;size:36;uniqueIndex:idx_task_text_delta_sequence,priority:1"`
+	Sequence  int64     `json:"sequence" gorm:"uniqueIndex:idx_task_text_delta_sequence,priority:2"`
 	Content   string    `json:"content" gorm:"type:text"`
 	ByteCount int64     `json:"byteCount"`
-	CreatedAt time.Time `json:"createdAt" gorm:"index:idx_task_text_deltas_user_created,priority:2"`
+	CreatedAt time.Time `json:"createdAt" gorm:"index:idx_task_text_delta_window,priority:2"`
 	ExpiresAt time.Time `json:"expiresAt" gorm:"index"`
+}
+
+// TaskTextChunk stores recoverable text-generation deltas for task attempts.
+type TaskTextChunk struct {
+	ID        string    `json:"id" gorm:"primaryKey;size:36"`
+	UserID    string    `json:"userId" gorm:"index;size:36"`
+	TaskID    string    `json:"taskId" gorm:"index;size:36;uniqueIndex:idx_task_text_chunk_sequence,priority:1"`
+	Attempt   int       `json:"attempt" gorm:"uniqueIndex:idx_task_text_chunk_sequence,priority:2"`
+	Sequence  int64     `json:"sequence" gorm:"uniqueIndex:idx_task_text_chunk_sequence,priority:3"`
+	Delta     string    `json:"delta" gorm:"type:text"`
+	CreatedAt time.Time `json:"createdAt" gorm:"index"`
 }
 
 type Session struct {
