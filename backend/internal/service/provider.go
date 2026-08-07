@@ -1428,6 +1428,43 @@ func runVideoTask(ctx context.Context, input canvasGenerationInput) (map[string]
 	return nil, errors.New("视频生成超时")
 }
 
+// queryXAIVideoTask only reads an already accepted xAI task. Manual recovery must never submit another billable task.
+func queryXAIVideoTask(ctx context.Context, input canvasGenerationInput, id string) (map[string]interface{}, string, error) {
+	var state map[string]interface{}
+	if err := getJSON(ctx, input.Config, "/videos/"+id, &state); err != nil {
+		return nil, "", err
+	}
+	if data, ok := state["data"].(map[string]interface{}); ok {
+		state = data
+	}
+	status := strings.ToLower(stringField(state, "status"))
+	if status != "completed" && status != "succeeded" && status != "success" && status != "done" {
+		if status == "failed" || status == "cancelled" {
+			return nil, status, errors.New("视频生成失败")
+		}
+		return nil, status, nil
+	}
+	if videoURL := newAPIVideoResultURL(state); videoURL != "" {
+		data, mimeType, err := getProviderExternalBinary(withProviderRequestKind(ctx, "download"), input.Config, videoURL)
+		if err == nil {
+			mimeType = normalizedMediaMimeType(mimeType, data)
+			return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType}}, status, nil
+		}
+		content, contentMimeType, contentErr := getBinary(ctx, input.Config, "/videos/"+id+"/content")
+		if contentErr == nil {
+			contentMimeType = normalizedMediaMimeType(contentMimeType, content)
+			return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(contentMimeType, content), "mimeType": contentMimeType}}, status, nil
+		}
+		return nil, status, fmt.Errorf("视频结果下载失败（任务 %s）：%w；内容接口回退失败：%v", id, err, contentErr)
+	}
+	data, mimeType, err := getBinary(ctx, input.Config, "/videos/"+id+"/content")
+	if err != nil {
+		return nil, status, err
+	}
+	mimeType = normalizedMediaMimeType(mimeType, data)
+	return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType}}, status, nil
+}
+
 func runGeminiVeoVideoTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
 	if len(input.ReferenceImages) > 1 || len(input.ReferenceVideos) > 0 || len(input.ReferenceAudios) > 0 {
 		return nil, errors.New("Gemini Veo 当前只支持 1 张起始图，不支持参考视频或音频")
