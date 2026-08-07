@@ -255,9 +255,13 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 	}[capability]
 	videoSeconds := "6"
 	videoSecondsValue := 6
+	audioVoice := "alloy"
 	if protocol == model.ChannelInterfaceVolcengineJiMengVideo {
 		videoSeconds = "5"
 		videoSecondsValue = 5
+	}
+	if protocol == model.ChannelInterfaceVolcenginePlanTTS {
+		audioVoice = volcenginePlanTTSDefaultSpeaker
 	}
 	input := canvasGenerationInput{
 		Mode:   capability,
@@ -278,7 +282,7 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 			VQuality:           "720",
 			VideoGenerateAudio: "false",
 			VideoWatermark:     "false",
-			AudioVoice:         "alloy",
+			AudioVoice:         audioVoice,
 			AudioFormat:        "mp3",
 			AudioSpeed:         "1",
 		},
@@ -456,7 +460,7 @@ func capabilityForProtocol(protocol model.ChannelInterfaceType) string {
 	switch protocol {
 	case model.ChannelInterfaceOpenAIImage, model.ChannelInterfaceGrokImage, model.ChannelInterfaceVolcengineArkImage, model.ChannelInterfaceVolcengineJiMengImage:
 		return "image"
-	case model.ChannelInterfaceOpenAIAudio, model.ChannelInterfaceAsyncAudio:
+	case model.ChannelInterfaceOpenAIAudio, model.ChannelInterfaceAsyncAudio, model.ChannelInterfaceVolcenginePlanTTS:
 		return "audio"
 	case model.ChannelInterfaceNewAPIVideo, model.ChannelInterfaceNewAPIChannel1, model.ChannelInterfaceNewAPIChannel2, model.ChannelInterfaceXAIVideo, model.ChannelInterfaceVolcengineArkVideo, model.ChannelInterfaceVolcengineJiMengVideo, model.ChannelInterfaceGeminiVeo:
 		return "video"

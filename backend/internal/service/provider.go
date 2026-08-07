@@ -1085,6 +1085,9 @@ func runAudioTask(ctx context.Context, input canvasGenerationInput) (map[string]
 			return nil, errors.New("角色配音缺少已解析的声音绑定")
 		}
 	}
+	if input.Config.InterfaceType == string(model.ChannelInterfaceVolcenginePlanTTS) {
+		return runVolcenginePlanTTSTask(ctx, input)
+	}
 	format := defaultString(input.Config.AudioFormat, "mp3")
 	body := map[string]interface{}{
 		"model":           input.Config.Model,
@@ -2042,7 +2045,7 @@ func validateGenerationInterface(mode string, interfaceType string) error {
 		"text":  {"chat-completion": true, "openai-response": true},
 		"image": {"openai-image": true, "grok-image": true, "volcengine-ark-image": true, "volcengine-jimeng-image": true},
 		"video": {"newapi": true, "newapi-channel-1": true, "newapi-channel-2": true, "xai-video": true, "volcengine-ark-video": true, "volcengine-jimeng-video": true, "gemini-veo": true},
-		"audio": {"openai-audio": true, "async-audio": true},
+		"audio": {"openai-audio": true, "async-audio": true, "volcengine-plan-tts": true},
 	}
 	if allowed[mode] != nil && !allowed[mode][interfaceType] {
 		return fmt.Errorf("接口类型 %s 不支持%s生成", interfaceType, mode)
