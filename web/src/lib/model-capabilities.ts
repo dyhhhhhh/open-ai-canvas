@@ -65,6 +65,7 @@ export type VideoCapabilityConfig = {
 const defaultImageSizes = ["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "21:9", "9:16", "2048x2048", "2048x1152", "1152x2048", "3840x2160", "2160x3840"];
 
 export function defaultImageCapabilityConfig(protocol?: ModelProtocol, model = ""): ImageCapabilityConfig {
+	const isGrokImageProtocol = protocol === "grok-image" || (protocol as string) === "xai-image";
     const image: ImageCapabilityConfig = {
         references: { promptMaxChars: 32000, maxImages: 16, maxImageBytes: 30 * 1024 * 1024, maskSupported: true },
         size: { parameter: "size", values: [...defaultImageSizes], default: "1:1", allowCustom: true },
@@ -74,7 +75,7 @@ export function defaultImageCapabilityConfig(protocol?: ModelProtocol, model = "
         outputFormat: { supported: true },
         maxOutputs: 15,
     };
-    if (protocol === "grok-image") {
+	if (isGrokImageProtocol) {
         image.references.maxImages = 1;
         image.references.maskSupported = false;
         image.size = { parameter: "none", values: [], default: "auto", allowCustom: false };
@@ -98,7 +99,7 @@ export function defaultImageCapabilityConfig(protocol?: ModelProtocol, model = "
         image.responseFormat.supported = false;
         image.outputFormat.supported = false;
     }
-    if (protocol !== "grok-image" && model.trim().toLowerCase().startsWith("grok-imagine-image")) {
+	if (!isGrokImageProtocol && model.trim().toLowerCase().startsWith("grok-imagine-image")) {
         image.references.maxImages = 0;
         image.references.maskSupported = false;
         image.size = { parameter: "none", values: [], default: "auto", allowCustom: false };

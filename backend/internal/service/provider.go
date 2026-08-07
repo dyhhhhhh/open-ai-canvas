@@ -701,7 +701,7 @@ func systemChannelIDFromBaseURL(baseURL string) string {
 }
 
 func runImageTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
-	if input.Config.InterfaceType == string(model.ChannelInterfaceGrokImage) {
+	if input.Config.InterfaceType == string(model.ChannelInterfaceGrokImage) || input.Config.InterfaceType == string(model.ChannelInterfaceXAIImageLegacy) {
 		return runGrokImageTask(ctx, input)
 	}
 	if input.Config.InterfaceType == string(model.ChannelInterfaceVolcengineJiMengImage) {
@@ -2043,7 +2043,7 @@ func validateGenerationInterface(mode string, interfaceType string) error {
 	}
 	allowed := map[string]map[string]bool{
 		"text":  {"chat-completion": true, "openai-response": true},
-		"image": {"openai-image": true, "grok-image": true, "volcengine-ark-image": true, "volcengine-jimeng-image": true},
+		"image": {"openai-image": true, "grok-image": true, "xai-image": true, "volcengine-ark-image": true, "volcengine-jimeng-image": true},
 		"video": {"newapi": true, "newapi-channel-1": true, "newapi-channel-2": true, "xai-video": true, "volcengine-ark-video": true, "volcengine-jimeng-video": true, "gemini-veo": true},
 		"audio": {"openai-audio": true, "async-audio": true, "volcengine-plan-tts": true},
 	}

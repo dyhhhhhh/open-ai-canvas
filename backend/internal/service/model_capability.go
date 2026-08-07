@@ -106,7 +106,7 @@ func DefaultImageCapabilityConfig(protocol string, modelName string) *ImageCapab
 		MaxOutputs:            15,
 	}
 	switch model.ChannelInterfaceType(protocol) {
-	case model.ChannelInterfaceGrokImage:
+	case model.ChannelInterfaceGrokImage, model.ChannelInterfaceXAIImageLegacy:
 		image.References.MaxImages = 1
 		image.References.MaskSupported = false
 		image.Size = ImageSizeConfig{Parameter: "none", Values: []string{}, Default: "auto", AllowCustom: false}
@@ -129,7 +129,7 @@ func DefaultImageCapabilityConfig(protocol string, modelName string) *ImageCapab
 		image.ResponseFormat.Supported = false
 		image.OutputFormat.Supported = false
 	}
-	if model.ChannelInterfaceType(protocol) != model.ChannelInterfaceGrokImage && strings.HasPrefix(strings.ToLower(strings.TrimSpace(modelName)), "grok-imagine-image") {
+	if model.ChannelInterfaceType(protocol) != model.ChannelInterfaceGrokImage && model.ChannelInterfaceType(protocol) != model.ChannelInterfaceXAIImageLegacy && strings.HasPrefix(strings.ToLower(strings.TrimSpace(modelName)), "grok-imagine-image") {
 		image.References.MaxImages = 0
 		image.References.MaskSupported = false
 		image.Size = ImageSizeConfig{Parameter: "none", Values: []string{}, Default: "auto", AllowCustom: false}

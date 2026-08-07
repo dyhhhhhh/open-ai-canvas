@@ -77,6 +77,7 @@ function protocolGroups(protocols: ModelProtocolDefinition[]) {
 }
 
 export function modelProtocolDefinition(value?: string) {
+    if (value === "xai-image") value = "grok-image";
     return MODEL_PROTOCOLS.find((item) => item.value === value);
 }
 
@@ -95,6 +96,7 @@ export function modelProtocolSummary(value?: string) {
 }
 
 export function normalizeModelProtocol(value: unknown): ModelProtocol | undefined {
+    if (value === "xai-image") return "grok-image";
     return typeof value === "string" && MODEL_PROTOCOLS.some((item) => item.value === value) ? (value as ModelProtocol) : undefined;
 }
 

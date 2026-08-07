@@ -58,10 +58,13 @@ const (
 	ChannelScopeSystem ChannelScope = "system"
 	ChannelScopeUser   ChannelScope = "user"
 
-	ChannelInterfaceChatCompletion        ChannelInterfaceType = "chat-completion"
-	ChannelInterfaceOpenAIResponse        ChannelInterfaceType = "openai-response"
-	ChannelInterfaceOpenAIImage           ChannelInterfaceType = "openai-image"
-	ChannelInterfaceGrokImage             ChannelInterfaceType = "grok-image"
+	ChannelInterfaceChatCompletion ChannelInterfaceType = "chat-completion"
+	ChannelInterfaceOpenAIResponse ChannelInterfaceType = "openai-response"
+	ChannelInterfaceOpenAIImage    ChannelInterfaceType = "openai-image"
+	ChannelInterfaceGrokImage      ChannelInterfaceType = "grok-image"
+	// ChannelInterfaceXAIImageLegacy preserves system channels created before
+	// the upstream Grok image protocol was renamed to grok-image.
+	ChannelInterfaceXAIImageLegacy        ChannelInterfaceType = "xai-image"
 	ChannelInterfaceVolcengineArkImage    ChannelInterfaceType = "volcengine-ark-image"
 	ChannelInterfaceVolcengineJiMengImage ChannelInterfaceType = "volcengine-jimeng-image"
 	ChannelInterfaceOpenAIAudio           ChannelInterfaceType = "openai-audio"
