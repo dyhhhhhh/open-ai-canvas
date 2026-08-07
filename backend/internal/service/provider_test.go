@@ -12,40 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"infinite-canvas/backend/internal/model"
 )
 
 const testReferenceImageDataURL = "data:image/png;base64,aGVsbG8="
-
-func TestResolveProviderConfigDecryptsSystemChannelCredentials(t *testing.T) {
-	svc, db := newChannelModelTestService(t)
-	svc.dataDir = t.TempDir()
-	channel := model.ModelChannel{
-		ID: "system-channel", UserID: "admin", Scope: model.ChannelScopeSystem, Enabled: true,
-		Name: "System", BaseURL: "https://example.test/v1", APIKey: "plain-api-key", APIFormat: "openai", ModelsJSON: `["image-model"]`,
-	}
-	if err := svc.encryptSystemChannelSecrets(&channel); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Create(&channel).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Create(&model.ChannelModel{
-		ID: "image-model", ChannelID: channel.ID, ModelKey: "image-model", Capability: "image",
-		Protocol: model.ChannelInterfaceVolcengineArkImage, Enabled: true,
-	}).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	config, err := svc.resolveProviderConfig(providerConfig{ChannelID: channel.ID, Model: "image-model"})
-	if err != nil {
-		t.Fatalf("resolveProviderConfig() error = %v", err)
-	}
-	if config.APIKey != "plain-api-key" {
-		t.Fatalf("APIKey = %q, want decrypted system key", config.APIKey)
-	}
-}
 
 func TestWriteMediaPartSanitizesFilenameAndSetsMimeType(t *testing.T) {
 	var body bytes.Buffer
@@ -83,6 +52,60 @@ func TestWriteMediaPartSanitizesFilenameAndSetsMimeType(t *testing.T) {
 	}
 	if string(data) != "hello" {
 		t.Fatalf("file data = %q, want hello", data)
+	}
+}
+
+func TestParseTextEventStreamSupportsResponsesAndChat(t *testing.T) {
+	responses := []byte(`event: response.output_text.delta
+data: {"delta":"{\"title\":\"分镜\"}"}
+
+event: response.output_text.delta
+data: {"delta":"}"}
+
+data: [DONE]
+
+`)
+	if got, err := parseTextEventStream(responses, "responses"); err != nil || got != `{"title":"分镜"}` {
+		t.Fatalf("Responses stream = %q, err = %v", got, err)
+	}
+
+	chat := []byte(`data: {"choices":[{"delta":{"content":"第一镜"}}]}
+
+data: {"choices":[{"delta":{"content":"：远景"}}]}
+
+data: [DONE]
+
+`)
+	if got, err := parseTextEventStream(chat, "chat-completion"); err != nil || got != "第一镜：远景" {
+		t.Fatalf("Chat stream = %q, err = %v", got, err)
+	}
+}
+
+func TestPostStreamingTextSetsStreamHeaders(t *testing.T) {
+	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Errorf("Accept = %q", got)
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		if stream, ok := body["stream"].(bool); !ok || !stream {
+			t.Errorf("stream body field = %#v", body["stream"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"流式分镜"}}]}
+
+data: [DONE]
+
+`))
+	}))
+	defer server.Close()
+
+	got, err := postStreamingText(context.Background(), providerConfig{BaseURL: server.URL, APIKey: "test-key"}, "/chat/completions", map[string]interface{}{"model": "test-model"}, "chat-completion")
+	if err != nil || got != "流式分镜" {
+		t.Fatalf("postStreamingText() = %q, err = %v", got, err)
 	}
 }
 
@@ -124,33 +147,6 @@ func TestVolcengineArkImageBodyUsesJSONReferencesAndDownscalesSize(t *testing.T)
 	}
 }
 
-func TestNormalizeVolcengineArkImageSizeUpscalesToProviderMinimum(t *testing.T) {
-	size := normalizeVolcengineArkImageSize("1024x1024")
-	if size != "1920x1920" {
-		t.Fatalf("normalized size = %q, want 1920x1920", size)
-	}
-}
-
-func TestNormalizeVolcengineArkImageSizePreservesAspectRatioAtProviderMinimum(t *testing.T) {
-	size := normalizeVolcengineArkImageSize("1024x1536")
-	parts := strings.Split(size, "x")
-	if len(parts) != 2 {
-		t.Fatalf("normalized size = %q", size)
-	}
-	width, widthErr := strconv.Atoi(parts[0])
-	height, heightErr := strconv.Atoi(parts[1])
-	if widthErr != nil || heightErr != nil {
-		t.Fatalf("normalized size = %q", size)
-	}
-	pixels := int64(width) * int64(height)
-	if pixels < volcengineArkImageMinPixels || pixels > volcengineArkImageMaxPixels {
-		t.Fatalf("normalized size = %q (%d pixels), outside provider limits", size, pixels)
-	}
-	if height != width*3/2 {
-		t.Fatalf("normalized size = %q, want 2:3 aspect ratio", size)
-	}
-}
-
 func TestVolcengineArkImageRejectsMaskBeforeRequest(t *testing.T) {
 	_, err := runImageTask(context.Background(), canvasGenerationInput{
 		Prompt: "edit only the masked area",
@@ -162,28 +158,63 @@ func TestVolcengineArkImageRejectsMaskBeforeRequest(t *testing.T) {
 	}
 }
 
-func TestXAIImageBodyUsesAspectRatioInsteadOfPixelSize(t *testing.T) {
-	body := xaiImageBody(canvasGenerationInput{
-		Prompt: "rainy apartment building",
-		Config: providerConfig{Model: "grok-imagine-image", Size: "9:16", Quality: "2k"},
+func TestRunGrokImageTaskUsesJSONEditContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/images/edits" {
+			t.Errorf("path = %q, want /v1/images/edits", r.URL.Path)
+		}
+		if contentType := r.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+			t.Errorf("Content-Type = %q, want application/json", contentType)
+		}
+		var body grokImageRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if body.Model != "grok-imagine-image-quality" || body.N != 1 || body.ResponseFormat != "url" {
+			t.Fatalf("request body = %#v", body)
+		}
+		if body.Image == nil || body.Image.URL != testReferenceImageDataURL {
+			t.Fatalf("image = %#v", body.Image)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"url":"https://example.com/result.png"}]}`))
+	}))
+	defer server.Close()
+
+	result, err := runImageTask(context.Background(), canvasGenerationInput{
+		Mode:            "image",
+		Prompt:          "edit the reference",
+		Config:          providerConfig{BaseURL: server.URL, APIKey: "key", Model: "grok-imagine-image-quality", InterfaceType: "grok-image"},
+		ReferenceImages: []providerMedia{{DataURL: testReferenceImageDataURL}},
 	})
-	if got, _ := body["aspect_ratio"].(string); got != "9:16" {
-		t.Fatalf("aspect_ratio = %q, want 9:16", got)
+	if err != nil {
+		t.Fatalf("runImageTask() error = %v", err)
 	}
-	if _, exists := body["size"]; exists {
-		t.Fatalf("xAI image body must not include size: %#v", body)
-	}
-	if _, exists := body["resolution"]; exists {
-		t.Fatalf("xAI image body must leave resolution to the upstream: %#v", body)
-	}
-	if _, exists := body["quality"]; exists {
-		t.Fatalf("xAI image body must not include quality: %#v", body)
+	images, _ := result["images"].([]map[string]string)
+	if len(images) != 1 || images[0]["dataUrl"] != "https://example.com/result.png" {
+		t.Fatalf("images = %#v", result["images"])
 	}
 }
 
-func TestNormalizeXAIImageAspectRatioConvertsPixelSize(t *testing.T) {
-	if got := normalizeXAIImageAspectRatio("1024x1824"); got != "9:16" {
-		t.Fatalf("normalizeXAIImageAspectRatio() = %q, want 9:16", got)
+func TestGrokImageRequestBodyRejectsMaskAndMultipleReferences(t *testing.T) {
+	if _, _, err := grokImageRequestBody(canvasGenerationInput{Config: providerConfig{InterfaceType: "grok-image"}, Mask: &providerMedia{DataURL: testReferenceImageDataURL}}); err == nil || !strings.Contains(err.Error(), "不支持蒙版") {
+		t.Fatalf("mask error = %v", err)
+	}
+	if _, _, err := grokImageRequestBody(canvasGenerationInput{Config: providerConfig{InterfaceType: "grok-image"}, ReferenceImages: []providerMedia{{DataURL: testReferenceImageDataURL}, {DataURL: testReferenceImageDataURL}}}); err == nil || !strings.Contains(err.Error(), "只支持 1 张") {
+		t.Fatalf("multiple reference error = %v", err)
+	}
+}
+
+func TestGrokImageRequestBodyPrefersPublicURL(t *testing.T) {
+	body, path, err := grokImageRequestBody(canvasGenerationInput{
+		Config:          providerConfig{Model: "grok-imagine-image", InterfaceType: "grok-image"},
+		ReferenceImages: []providerMedia{{URL: "https://example.com/reference.png", DataURL: testReferenceImageDataURL}},
+	})
+	if err != nil {
+		t.Fatalf("grokImageRequestBody() error = %v", err)
+	}
+	if path != "/images/edits" || body.Image == nil || body.Image.URL != "https://example.com/reference.png" {
+		t.Fatalf("path = %q, image = %#v", path, body.Image)
 	}
 }
 
@@ -319,7 +350,7 @@ func TestTextReferenceImageRejectsInternalAssetURL(t *testing.T) {
 }
 
 func TestSeedanceVideosBodyUsesVideosEndpointFields(t *testing.T) {
-	body, err := seedanceVideosBody(canvasGenerationInput{
+	body, err := seedanceVideosRequestBody(canvasGenerationInput{
 		Prompt: "make it move",
 		Config: providerConfig{
 			Model:              "seedance-2.0-mini-480p",
@@ -337,32 +368,26 @@ func TestSeedanceVideosBodyUsesVideosEndpointFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seedanceVideosBody() error = %v", err)
 	}
-	if body["model"] != "seedance-2.0-mini-480p" {
-		t.Fatalf("model = %#v", body["model"])
+	if body.Model != "seedance-2.0-mini-480p" {
+		t.Fatalf("model = %#v", body.Model)
 	}
-	if body["aspect_ratio"] != "9:16" || body["duration"] != 8 {
-		t.Fatalf("size fields = %#v %#v", body["aspect_ratio"], body["duration"])
+	if body.AspectRatio != "9:16" || body.Duration != 8 {
+		t.Fatalf("size fields = %#v %#v", body.AspectRatio, body.Duration)
 	}
-	if body["generate_audio"] != true {
-		t.Fatalf("generate_audio = %#v, want true", body["generate_audio"])
+	if body.GenerateAudio == nil || !*body.GenerateAudio {
+		t.Fatalf("generate_audio = %#v, want true", body.GenerateAudio)
 	}
-	if body["image_url"] != testReferenceImageDataURL {
-		t.Fatalf("image_url = %#v", body["image_url"])
+	if body.ImageURL != testReferenceImageDataURL {
+		t.Fatalf("image_url = %#v", body.ImageURL)
 	}
-	referenceImages, ok := body["reference_image_urls"].([]string)
-	if !ok || len(referenceImages) != 1 || referenceImages[0] != "data:image/png;base64,d29ybGQ=" {
-		t.Fatalf("reference_image_urls = %#v", body["reference_image_urls"])
+	if len(body.ReferenceImageURLs) != 1 || body.ReferenceImageURLs[0] != "data:image/png;base64,d29ybGQ=" {
+		t.Fatalf("reference_image_urls = %#v", body.ReferenceImageURLs)
 	}
-	referenceVideos, ok := body["reference_videos"].([]string)
-	if !ok || len(referenceVideos) != 1 || referenceVideos[0] != "https://example.com/ref.mp4" {
-		t.Fatalf("reference_videos = %#v", body["reference_videos"])
+	if len(body.ReferenceVideos) != 1 || body.ReferenceVideos[0] != "https://example.com/ref.mp4" {
+		t.Fatalf("reference_videos = %#v", body.ReferenceVideos)
 	}
-	referenceAudios, ok := body["reference_audios"].([]string)
-	if !ok || len(referenceAudios) != 1 || referenceAudios[0] != "data:audio/mpeg;base64,AAAA" {
-		t.Fatalf("reference_audios = %#v", body["reference_audios"])
-	}
-	if body["content"] != nil || body["ratio"] != nil {
-		t.Fatalf("unexpected agent-plan fields in body: %#v", body)
+	if len(body.ReferenceAudios) != 1 || body.ReferenceAudios[0] != "data:audio/mpeg;base64,AAAA" {
+		t.Fatalf("reference_audios = %#v", body.ReferenceAudios)
 	}
 }
 
@@ -377,7 +402,7 @@ func TestSeedanceVideosBodyHonorsGenerateAudio(t *testing.T) {
 		{name: "explicit disabled", value: "false", want: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			body, err := seedanceVideosBody(canvasGenerationInput{
+			body, err := seedanceVideosRequestBody(canvasGenerationInput{
 				Prompt: "make it move",
 				Config: providerConfig{
 					Model:              "seedance-2.0-mini-480p",
@@ -387,15 +412,15 @@ func TestSeedanceVideosBodyHonorsGenerateAudio(t *testing.T) {
 			if err != nil {
 				t.Fatalf("seedanceVideosBody() error = %v", err)
 			}
-			if body["generate_audio"] != test.want {
-				t.Fatalf("generate_audio = %#v, want %v", body["generate_audio"], test.want)
+			if body.GenerateAudio == nil || *body.GenerateAudio != test.want {
+				t.Fatalf("generate_audio = %#v, want %v", body.GenerateAudio, test.want)
 			}
 		})
 	}
 }
 
 func TestSeedanceVideosBodyUsesOrderedFrameImageURLsWhenConfigured(t *testing.T) {
-	body, err := seedanceVideosBody(canvasGenerationInput{
+	body, err := seedanceVideosRequestBody(canvasGenerationInput{
 		Prompt: "make it move",
 		Config: providerConfig{Model: "seedance-2.0-mini-480p"},
 		ReferenceImages: []providerMedia{
@@ -408,9 +433,9 @@ func TestSeedanceVideosBodyUsesOrderedFrameImageURLsWhenConfigured(t *testing.T)
 	if err != nil {
 		t.Fatalf("seedanceVideosBody() error = %v", err)
 	}
-	imageURLs, ok := body["image_urls"].([]string)
-	if !ok || len(imageURLs) != 3 {
-		t.Fatalf("image_urls = %#v", body["image_urls"])
+	imageURLs := body.ImageURLs
+	if len(imageURLs) != 3 {
+		t.Fatalf("image_urls = %#v", imageURLs)
 	}
 	want := []string{testReferenceImageDataURL, "data:image/png;base64,d29ybGQ=", "data:image/png;base64,Y2hhcmFjdGVy"}
 	for index := range want {
@@ -418,11 +443,11 @@ func TestSeedanceVideosBodyUsesOrderedFrameImageURLsWhenConfigured(t *testing.T)
 			t.Fatalf("image_urls = %#v, want %#v", imageURLs, want)
 		}
 	}
-	if body["image_url"] != nil || body["reference_image_urls"] != nil {
+	if body.ImageURL != "" || body.ReferenceImageURLs != nil {
 		t.Fatalf("unexpected legacy image fields in body: %#v", body)
 	}
-	if prompt := body["prompt"]; prompt != "make it move" {
-		t.Fatalf("prompt = %#v", body["prompt"])
+	if body.Prompt != "make it move" {
+		t.Fatalf("prompt = %#v", body.Prompt)
 	}
 }
 
@@ -590,7 +615,7 @@ func TestRunVideoTaskUsesXAIVideoGenerationEndpoint(t *testing.T) {
 				}
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"internal-request-id","request_id":"video-1"}`))
+			_, _ = w.Write([]byte(`{"request_id":"video-1"}`))
 		case "GET /v1/videos/video-1":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"done","video":{"url":"` + server.URL + `/files/video.mp4"}}`))
@@ -631,82 +656,8 @@ func TestRunVideoTaskUsesXAIVideoGenerationEndpoint(t *testing.T) {
 	}
 }
 
-func TestQueryXAIVideoTaskRecoversExistingRequest(t *testing.T) {
-	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
-	paths := make([]string, 0, 2)
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.Method+" "+r.URL.Path)
-		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/videos/video-request":
-			_, _ = w.Write([]byte(`{"status":"done","video":{"url":"` + server.URL + `/files/video.mp4"}}`))
-		case "GET /files/video.mp4":
-			w.Header().Set("Content-Type", "video/mp4")
-			_, _ = w.Write([]byte("video"))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	result, status, err := queryXAIVideoTask(context.Background(), canvasGenerationInput{
-		Config: providerConfig{BaseURL: server.URL + "/v1", APIKey: "test-key", InterfaceType: "xai-video"},
-	}, "video-request")
-	if err != nil {
-		t.Fatalf("queryXAIVideoTask() error = %v", err)
-	}
-	if status != "done" {
-		t.Fatalf("status = %q, want done", status)
-	}
-	video, ok := result["video"].(map[string]interface{})
-	if !ok || video["dataUrl"] != "data:video/mp4;base64,dmlkZW8=" {
-		t.Fatalf("video = %#v", result["video"])
-	}
-	want := "GET /v1/videos/video-request,GET /files/video.mp4"
-	if got := strings.Join(paths, ","); got != want {
-		t.Fatalf("paths = %q, want %q", got, want)
-	}
-}
-
-func TestRunVideoTaskFallsBackToGrokContentEndpoint(t *testing.T) {
-	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
-	paths := make([]string, 0, 3)
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.Method+" "+r.URL.Path)
-		switch r.Method + " " + r.URL.Path {
-		case "POST /v1/videos/generations":
-			_, _ = w.Write([]byte(`{"request_id":"video-local"}`))
-		case "GET /v1/videos/video-local":
-			_, _ = w.Write([]byte(`{"status":"done","video":{"url":"http://127.0.0.1:1/files/video.mp4"}}`))
-		case "GET /v1/videos/video-local/content":
-			w.Header().Set("Content-Type", "video/mp4")
-			_, _ = w.Write([]byte("video"))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	result, err := runVideoTask(context.Background(), canvasGenerationInput{
-		Prompt: "make it move",
-		Config: providerConfig{BaseURL: server.URL + "/v1", APIKey: "test-key", Model: "grok-imagine-video", InterfaceType: "xai-video"},
-	})
-	if err != nil {
-		t.Fatalf("runVideoTask() error = %v", err)
-	}
-	video, ok := result["video"].(map[string]interface{})
-	if !ok || video["dataUrl"] != "data:video/mp4;base64,dmlkZW8=" {
-		t.Fatalf("video = %#v", result["video"])
-	}
-	want := "POST /v1/videos/generations,GET /v1/videos/video-local,GET /v1/videos/video-local/content"
-	if got := strings.Join(paths, ","); got != want {
-		t.Fatalf("paths = %q, want %q", got, want)
-	}
-}
-
 func TestXAIVideoBodyUsesOfficialImageShapeAndNormalizesSettings(t *testing.T) {
-	body, err := grokVideoBody(canvasGenerationInput{
+	body, err := xaiVideoRequestBody(canvasGenerationInput{
 		Prompt: "make it move",
 		Config: providerConfig{
 			Model:         "grok-imagine-video-1.5",
@@ -721,22 +672,16 @@ func TestXAIVideoBodyUsesOfficialImageShapeAndNormalizesSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("grokVideoBody() error = %v", err)
 	}
-	if body["duration"] != 20 || body["aspect_ratio"] != "9:16" || body["resolution"] != "1080p" {
+	if body.Duration != 20 || body.AspectRatio != "9:16" || body.Resolution != "1080p" {
 		t.Fatalf("xAI settings = %#v", body)
 	}
-	image, ok := body["image"].(map[string]interface{})
-	if !ok || image["url"] != testReferenceImageDataURL {
-		t.Fatalf("image = %#v", body["image"])
-	}
-	for _, legacyField := range []string{"seconds", "size", "images"} {
-		if _, exists := body[legacyField]; exists {
-			t.Fatalf("body includes legacy field %q: %#v", legacyField, body)
-		}
+	if body.Image == nil || body.Image.URL != testReferenceImageDataURL {
+		t.Fatalf("image = %#v", body.Image)
 	}
 }
 
 func TestXAIVideoBodyRejectsMultipleStartImages(t *testing.T) {
-	_, err := grokVideoBody(canvasGenerationInput{
+	_, err := xaiVideoRequestBody(canvasGenerationInput{
 		Config: providerConfig{Model: "grok-imagine-video-1.5", InterfaceType: "xai-video"},
 		ReferenceImages: []providerMedia{
 			{ID: "image-1", DataURL: testReferenceImageDataURL},
@@ -792,7 +737,7 @@ func TestNewAPIVideoOmitsImagesForTextToVideoOperation(t *testing.T) {
 }
 
 func TestSeedanceVideosBodyRequiresImageForVideoOrAudioReferences(t *testing.T) {
-	_, err := seedanceVideosBody(canvasGenerationInput{
+	_, err := seedanceVideosRequestBody(canvasGenerationInput{
 		Prompt:          "make it move",
 		Config:          providerConfig{Model: "seedance-2.0-mini-480p"},
 		ReferenceVideos: []providerMedia{{ID: "video-1", URL: "https://example.com/ref.mp4"}},
@@ -1075,7 +1020,7 @@ func TestRunGeminiVeoVideoTaskUsesLongRunningOperation(t *testing.T) {
 }
 
 func TestNewAPIChannel2SingleImageModelsRequireOneReference(t *testing.T) {
-	_, err := newAPIChannel2VideoBody(canvasGenerationInput{Config: providerConfig{Model: "grok-video-1.5", VideoSeconds: "6"}})
+	_, err := newAPIChannel2VideoRequestBody(canvasGenerationInput{Config: providerConfig{Model: "grok-video-1.5", VideoSeconds: "6"}})
 	if err == nil {
 		t.Fatal("newAPIChannel2VideoBody() error = nil")
 	}
@@ -1085,7 +1030,7 @@ func TestNewAPIChannel2SingleImageModelsRequireOneReference(t *testing.T) {
 }
 
 func TestNewAPIChannel2SingleImageModelUsesReferenceForStaleTextToVideoMetadata(t *testing.T) {
-	body, err := newAPIChannel2VideoBody(canvasGenerationInput{
+	body, err := newAPIChannel2VideoRequestBody(canvasGenerationInput{
 		Config:          providerConfig{Model: "grok-video-1.5", VideoSeconds: "6"},
 		ReferenceImages: []providerMedia{{ID: "image-1", DataURL: testReferenceImageDataURL}},
 		Metadata:        map[string]interface{}{"videoEditOperation": "text_to_video"},
@@ -1093,14 +1038,14 @@ func TestNewAPIChannel2SingleImageModelUsesReferenceForStaleTextToVideoMetadata(
 	if err != nil {
 		t.Fatalf("newAPIChannel2VideoBody() error = %v", err)
 	}
-	images, ok := body["image_urls"].([]string)
-	if !ok || len(images) != 1 || images[0] != testReferenceImageDataURL {
-		t.Fatalf("image_urls = %#v", body["image_urls"])
+	images := body.ImageURLs
+	if len(images) != 1 || images[0] != testReferenceImageDataURL {
+		t.Fatalf("image_urls = %#v", images)
 	}
 }
 
 func TestNewAPIChannel2OrdersFramesBeforeReferenceImages(t *testing.T) {
-	body, err := newAPIChannel2VideoBody(canvasGenerationInput{
+	body, err := newAPIChannel2VideoRequestBody(canvasGenerationInput{
 		Config: providerConfig{Model: "Seedance 2 Mini", VideoSeconds: "10"},
 		ReferenceImages: []providerMedia{
 			{ID: "character", DataURL: "data:image/png;base64,Y2hhcmFjdGVy"},
@@ -1112,15 +1057,15 @@ func TestNewAPIChannel2OrdersFramesBeforeReferenceImages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAPIChannel2VideoBody() error = %v", err)
 	}
-	images, ok := body["image_urls"].([]string)
+	images := body.ImageURLs
 	want := []string{"data:image/png;base64,Zmlyc3Q=", "data:image/png;base64,bGFzdA==", "data:image/png;base64,Y2hhcmFjdGVy"}
-	if !ok || !reflect.DeepEqual(images, want) {
-		t.Fatalf("image_urls = %#v, want %#v", body["image_urls"], want)
+	if !reflect.DeepEqual(images, want) {
+		t.Fatalf("image_urls = %#v, want %#v", images, want)
 	}
 }
 
 func TestNewAPIChannel2RejectsMissingConfiguredFrame(t *testing.T) {
-	_, err := newAPIChannel2VideoBody(canvasGenerationInput{
+	_, err := newAPIChannel2VideoRequestBody(canvasGenerationInput{
 		Config:          providerConfig{Model: "Seedance 2 Mini", VideoSeconds: "10"},
 		ReferenceImages: []providerMedia{{ID: "character", DataURL: testReferenceImageDataURL}},
 		Metadata:        map[string]interface{}{"videoStartFrameNodeId": "missing-frame", "videoEditOperation": "image_to_video"},
@@ -1143,6 +1088,9 @@ func TestValidateGenerationInterfaceRejectsMismatchedType(t *testing.T) {
 	if err := validateGenerationInterface("video", "xai-video"); err != nil {
 		t.Fatalf("validateGenerationInterface() error = %v", err)
 	}
+	if err := validateGenerationInterface("image", "grok-image"); err != nil {
+		t.Fatalf("validateGenerationInterface() error = %v", err)
+	}
 }
 
 func TestProcessTaskValidatesInterfaceBeforeHydratingMedia(t *testing.T) {
@@ -1156,8 +1104,61 @@ func TestProcessTaskValidatesInterfaceBeforeHydratingMedia(t *testing.T) {
 		ReferenceImages: []providerMedia{{StorageKey: "resource:missing"}},
 	}
 	raw, _ := json.Marshal(input)
-	_, err := (&Service{}).processCanvasGenerationTask(context.Background(), "user-1", "video_generate", "", string(raw))
+	_, err := (&Service{}).processCanvasGenerationTask(context.Background(), "user-1", "", "video_generate", "", string(raw))
 	if err == nil || !strings.Contains(err.Error(), "不支持video生成") {
 		t.Fatalf("processCanvasGenerationTask() error = %v", err)
+	}
+}
+
+func TestResolveGenerationStyleExecutionUsesValidatedPromptAssets(t *testing.T) {
+	enabled := true
+	profile := styleProfileDocument{
+		Prompt:          "base style",
+		ExecutionPolicy: "compatible-fallback",
+		Assets: []styleProfileAsset{
+			{ID: "prompt-1", Kind: "prompt", Title: "色彩约束", Provider: "builtin", Enabled: &enabled, Status: "validated", PromptFragment: "muted palette", TriggerWords: []string{"soft light"}},
+			{ID: "lora-1", Kind: "lora", Title: "东方角色 LoRA", Provider: "liblib", Enabled: &enabled, Status: "validated", SourceID: "model-1"},
+		},
+	}
+	prompt, status, warnings := resolveGenerationStyleExecution(profile, "image-model", "openai-image")
+	if prompt != "base style\nmuted palette\nsoft light" {
+		t.Fatalf("resolveGenerationStyleExecution() prompt = %q", prompt)
+	}
+	if status != "degraded" || len(warnings) != 1 || !strings.Contains(warnings[0], "LoRA") {
+		t.Fatalf("resolveGenerationStyleExecution() status = %q, warnings = %#v", status, warnings)
+	}
+}
+
+func TestResolveGenerationStyleExecutionStrictPolicyBlocksUnsupportedAsset(t *testing.T) {
+	profile := styleProfileDocument{
+		Prompt:          "base style",
+		ExecutionPolicy: "strict-assets",
+		Assets:          []styleProfileAsset{{ID: "reference-1", Kind: "reference", Title: "项目参考图", Provider: "project", Status: "validated", ReferenceResourceIDs: []string{"resource-1"}}},
+	}
+	_, status, warnings := resolveGenerationStyleExecution(profile, "image-model", "openai-image")
+	if status != "blocked" || len(warnings) != 1 {
+		t.Fatalf("resolveGenerationStyleExecution() status = %q, warnings = %#v", status, warnings)
+	}
+}
+
+func TestResolveGenerationStyleExecutionSkipsPromptAssetForOtherModel(t *testing.T) {
+	profile := styleProfileDocument{
+		Prompt:          "base style",
+		ExecutionPolicy: "compatible-fallback",
+		Assets: []styleProfileAsset{{
+			ID: "template-1", Kind: "template", Title: "专用模板", Provider: "workflow", Status: "validated",
+			BaseModels: []string{"supported-model"}, PromptFragment: "must not be injected",
+		}},
+	}
+	prompt, status, warnings := resolveGenerationStyleExecution(profile, "other-model", "openai-image")
+	if prompt != "base style" || status != "degraded" || len(warnings) != 1 {
+		t.Fatalf("resolveGenerationStyleExecution() prompt = %q, status = %q, warnings = %#v", prompt, status, warnings)
+	}
+}
+
+func TestEquivalentStyleProfileJSONIgnoresObjectKeyOrder(t *testing.T) {
+	equal, err := equivalentStyleProfileJSON(`{"schemaVersion":1,"presetId":"style-1","assets":[]}`, `{"assets":[],"presetId":"style-1","schemaVersion":1}`)
+	if err != nil || !equal {
+		t.Fatalf("equivalentStyleProfileJSON() equal = %v, err = %v", equal, err)
 	}
 }

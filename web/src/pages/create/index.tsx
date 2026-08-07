@@ -7,15 +7,17 @@ import { Link } from "react-router";
 
 import { AssetMediaPreview } from "@/components/asset-media-preview";
 import { CanvasResourceMentionTextarea } from "@/components/canvas/canvas-resource-mention-textarea";
+import { VoiceRecordingButton } from "@/components/conversation/voice-recording-button";
 import { ModelPicker } from "@/components/model-picker";
 import { canvasResourceMentionToken } from "@/lib/canvas/canvas-resource-references";
 import { createClientId } from "@/lib/client-id";
 import { generationErrorMessage } from "@/lib/generation-error";
-import { modelCapabilityConfigFor, normalizeVideoValue, videoDurationAllowed, videoDurationOptions, type VideoCapabilityConfig } from "@/lib/model-capabilities";
 import { VIDEO_RESOLUTION_OPTIONS } from "@/lib/video-generation-options";
-import { isGenerationTaskSubmissionUncertain, parseBackendGenerationResult, submitBackendGenerationTask, submitBackendGenerationTaskBatch, type BackendGenerationResult } from "@/services/api/generation-task";
+import { modelCapabilityConfigFor, normalizeImageValue, normalizeVideoValue, videoDurationAllowed, videoDurationOptions, type ImageCapabilityConfig, type VideoCapabilityConfig } from "@/lib/model-capabilities";
+import { parseBackendGenerationResult, runBackendGenerationTask, runBackendGenerationTaskBatch, type BackendGenerationResult } from "@/services/api/generation-task";
+import { requestImageQuestion } from "@/services/api/image";
 import { listAddedSkills, type Skill } from "@/services/api/skills";
-import { cancelGenerationTask, getTaskTextChunks, listGenerationTasks, queryGenerationTask, recoverGenerationTasks, taskTextEventsUrl, type GenerationTask, type TaskTextStream } from "@/services/api/task-center";
+import { listGenerationTasks, queryGenerationTask, type GenerationTask } from "@/services/api/task-center";
 import { storeGeneratedVideo } from "@/services/api/video";
 import { uploadMediaFile } from "@/services/file-storage";
 import { resolveImageUrl, uploadImage, type UploadedImage } from "@/services/image-storage";
@@ -25,7 +27,7 @@ import { buildCreationMentionReferences, creationReferenceMetadata, displayCreat
 import { creationAssetKey, creationAttachmentFromAsset, creationAttachmentFromImage, creationAttachmentFromVideo, creationAttachmentFromVideoAsset, creationImageAsset, creationVideoAsset, isSameCreationAsset, type CreationAssetIdentity, type CreationAttachment } from "./creation-assets";
 
 type CreationMode = "text" | "image" | "video";
-type CreationStatus = "streaming" | "pending" | "done" | "error" | "cancelled" | "draft";
+type CreationStatus = "streaming" | "pending" | "done" | "error" | "cancelled";
 type CreationSettings = { ratio: string; seconds: string; quality: string; videoQuality: string; count: string };
 type CreationMessage = {
     id: string;
@@ -41,9 +43,6 @@ type CreationMessage = {
     references?: CreationReference[];
     settings?: CreationSettings;
     taskIds?: string[];
-    submissionIds?: string[];
-    textCursors?: Record<string, number>;
-    textAttempts?: Record<string, number>;
 };
 type CreationConversation = { id: string; title: string; updatedAt: string; messages: CreationMessage[] };
 
@@ -103,8 +102,8 @@ export default function CreatePage() {
     const { message: toast } = App.useApp();
     const config = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
-    const addAsset = useAssetStore((state) => state.addAsset);
     const assets = useAssetStore((state) => state.assets);
+    const addAsset = useAssetStore((state) => state.addAsset);
     const [conversations, setConversations] = useState<CreationConversation[]>([]);
     const [activeId, setActiveId] = useState("");
     const [hydrated, setHydrated] = useState(false);
@@ -118,16 +117,15 @@ export default function CreatePage() {
     const [quality, setQuality] = useState("auto");
     const [videoQuality, setVideoQuality] = useState(config.vquality || "720");
     const [count, setCount] = useState(String(Math.max(1, Math.min(4, Number(config.count) || 1))));
-    const [submitting, setSubmitting] = useState(false);
+    const [busy, setBusy] = useState(false);
     const [historyOpen, setHistoryOpen] = useState(false);
     const [libraryOpen, setLibraryOpen] = useState(false);
+    const abortRef = useRef<AbortController | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const threadScrollRef = useRef<HTMLElement>(null);
     const followLatestMessageRef = useRef(true);
     const taskSyncWarningRef = useRef(false);
     const taskSyncInFlightRef = useRef(false);
-    const conversationsRef = useRef<CreationConversation[]>([]);
-    const textEventSourcesRef = useRef<Map<string, EventSource>>(new Map());
 
     const activeConversation = useMemo(() => conversations.find((item) => item.id === activeId) || conversations[0], [activeId, conversations]);
     const historyConversations = useMemo(
@@ -135,13 +133,21 @@ export default function CreatePage() {
         [activeId, conversations],
     );
     const selectedModel = mode === "text" ? config.textModel : mode === "image" ? config.imageModel : config.videoModel;
+    const imageProfile = useMemo(() => modelCapabilityConfigFor(config, selectedModel).image!, [config, selectedModel]);
     const videoProfile = useMemo(() => modelCapabilityConfigFor(config, selectedModel).video!, [config, selectedModel]);
     const mentionReferences = useMemo(() => buildCreationMentionReferences(addedSkills, attachments, draftReferences), [addedSkills, attachments, draftReferences]);
     const isEmpty = !activeConversation?.messages.length;
-    const pendingCreationKey = useMemo(() => pendingCreationTaskKey(conversations), [conversations]);
-    const activeTextTaskKey = useMemo(() => activeCreationTextTaskKey(activeConversation), [activeConversation]);
-    const busy = submitting || Boolean(activeConversation?.messages.some(isCreationInProgress));
-    conversationsRef.current = conversations;
+    const pendingMediaKey = useMemo(() => pendingCreationMediaKey(conversations), [conversations]);
+    const pendingTaskIds = useMemo(() => pendingCreationTaskIds(conversations), [conversations]);
+
+    useEffect(() => {
+        if (mode !== "image") return;
+        const normalized = normalizeImageValue(imageProfile, { size: ratio, quality, count });
+        setRatio(normalized.size);
+        setQuality(normalized.quality);
+        setCount(normalized.count);
+        if (attachments.length > imageProfile.references.maxImages) setAttachments((current) => current.slice(0, imageProfile.references.maxImages));
+    }, [mode, selectedModel, imageProfile]);
 
     useEffect(() => {
         if (mode !== "video") return;
@@ -155,49 +161,35 @@ export default function CreatePage() {
         let cancelled = false;
         void localforage.getItem<CreationConversation[]>(STORAGE_KEY).then((stored) => {
             if (cancelled) return;
-            const next = migrateCreationConversations(stored?.length ? stored : [newConversation()]);
+            const next = stored?.length ? stored : [newConversation()];
             setConversations(next);
             setActiveId(next[0].id);
             setHydrated(true);
         });
         return () => {
             cancelled = true;
+            // 页面卸载只停止当前页面的状态更新，后台任务由任务中心继续执行，返回页面后再恢复状态。
         };
     }, []);
 
     useEffect(() => {
-        if (!hydrated) return;
-        const timer = window.setTimeout(() => void localforage.setItem(STORAGE_KEY, conversations), 300);
-        return () => window.clearTimeout(timer);
+        if (hydrated) void localforage.setItem(STORAGE_KEY, conversations);
     }, [conversations, hydrated]);
 
     useEffect(() => {
-        if (!hydrated || !pendingCreationKey) return;
+        if (!hydrated || !pendingMediaKey || !pendingTaskIds.length) return;
         let cancelled = false;
         const syncTasks = async () => {
             if (taskSyncInFlightRef.current) return;
             taskSyncInFlightRef.current = true;
             try {
-                const snapshot = conversationsRef.current;
-                const knownTaskIds = creationPendingTaskIds(snapshot);
-                const submissionIds = creationPendingSubmissionIds(snapshot);
-                const recovered = await recoverGenerationTasks(submissionIds);
-                const legacySummaries = hasLegacyPendingCreationMessage(snapshot) ? await listGenerationTasks(100) : [];
-                const summaryByID = new Map([...recovered, ...legacySummaries].map((task) => [task.id, task]));
-                const taskIds = Array.from(new Set([...knownTaskIds, ...summaryByID.keys()]));
-                const queried = await Promise.all(taskIds.map(async (taskID) => queryGenerationTask(taskID).catch(() => summaryByID.get(taskID))));
-                const tasks = queried.filter((task): task is GenerationTask => Boolean(task));
-                const streams = await Promise.all(tasks
-                    .filter((task) => task.type === "canvas_text")
-                    .map((task) => getTaskTextChunks(task.id, creationTextCursor(snapshot, task.id)).catch(() => null)));
-                const persistedTasks = await persistCreationTaskResults(tasks);
+                const summaries = await listGenerationTasks(100);
+                const tasks = await enrichCreationTaskSummaries(summaries);
+                const pendingTaskIdSet = new Set(pendingTaskIds);
+                const persistedTasks = await persistCreationTaskResults(tasks.filter((task) => pendingTaskIdSet.has(task.id)));
                 if (cancelled) return;
                 taskSyncWarningRef.current = false;
-                setConversations((current) => {
-                    const attached = attachRecoveredCreationTasks(current, [...persistedTasks, ...recovered, ...legacySummaries]);
-                    const withText = mergeCreationTextStreams(attached, streams.filter((stream): stream is TaskTextStream => Boolean(stream)));
-                    return reconcileCreationTaskMessages(withText, persistedTasks);
-                });
+                setConversations((current) => reconcileCreationTaskMessages(current, persistedTasks));
             } catch (error) {
                 if (cancelled) return;
                 console.warn("创作任务状态同步失败", error);
@@ -215,36 +207,7 @@ export default function CreatePage() {
             cancelled = true;
             window.clearInterval(timer);
         };
-    }, [hydrated, pendingCreationKey, toast]);
-
-    useEffect(() => {
-        const activeTasks = activeCreationTextTasks(activeConversation);
-        const wanted = new Set(activeTasks.map((task) => task.id));
-        for (const [taskID, source] of textEventSourcesRef.current) {
-            if (!wanted.has(taskID)) {
-                source.close();
-                textEventSourcesRef.current.delete(taskID);
-            }
-        }
-        for (const task of activeTasks) {
-            if (textEventSourcesRef.current.has(task.id)) continue;
-            const source = new EventSource(taskTextEventsUrl(task.id, task.cursor), { withCredentials: true });
-            source.addEventListener("delta", (event) => {
-                try {
-                    const payload = JSON.parse((event as MessageEvent<string>).data) as { attempt: number; sequence: number; delta: string };
-                    setConversations((current) => mergeCreationTextStreams(current, [{ task: task.task, attempt: payload.attempt, chunks: [{ sequence: payload.sequence, delta: payload.delta }], nextSequence: payload.sequence }]));
-                } catch {
-                    // The polling synchronizer is the reliable fallback for malformed SSE data.
-                }
-            });
-            textEventSourcesRef.current.set(task.id, source);
-        }
-    }, [activeTextTaskKey, activeConversation]);
-
-    useEffect(() => () => {
-        for (const source of textEventSourcesRef.current.values()) source.close();
-        textEventSourcesRef.current.clear();
-    }, []);
+    }, [hydrated, pendingMediaKey, pendingTaskIds, toast]);
 
     useEffect(() => {
         let cancelled = false;
@@ -267,16 +230,17 @@ export default function CreatePage() {
         return () => window.cancelAnimationFrame(frame);
     }, [activeConversation?.id, activeConversation?.messages]);
 
+    const updateActive = useCallback((updater: (conversation: CreationConversation) => CreationConversation) => {
+        setConversations((current) => current.map((item) => item.id === activeId ? updater(item) : item));
+    }, [activeId]);
+
     const updateAssistant = useCallback((id: string, updater: (item: CreationMessage) => CreationMessage) => {
-        setConversations((current) => current.map((conversation) => {
-            if (!conversation.messages.some((item) => item.id === id)) return conversation;
-            return {
-                ...conversation,
-                updatedAt: new Date().toISOString(),
-                messages: conversation.messages.map((item) => item.id === id ? updater(item) : item),
-            };
+        updateActive((conversation) => ({
+            ...conversation,
+            updatedAt: new Date().toISOString(),
+            messages: conversation.messages.map((item) => item.id === id ? updater(item) : item),
         }));
-    }, []);
+    }, [updateActive]);
 
     const selectMode = (next: CreationMode) => {
         setMode(next);
@@ -287,10 +251,10 @@ export default function CreatePage() {
         }
     };
 
-    const maxReferences = mode === "video" ? videoProfile.operations.includes("image_to_video") ? videoProfile.references.maxImages : 0 : 6;
+    const maxReferences = mode === "video" ? videoProfile.operations.includes("image_to_video") ? videoProfile.references.maxImages : 0 : mode === "image" ? imageProfile.references.maxImages : 6;
     const addAttachments = (files: FileList | File[]) => {
-        if (mode === "video" && maxReferences === 0) {
-            toast.warning("当前模型不支持图生视频");
+        if ((mode === "image" || mode === "video") && maxReferences === 0) {
+            toast.warning(mode === "image" ? "当前图片模型不支持参考图" : "当前模型不支持图生视频");
             return;
         }
         const next = Array.from(files)
@@ -336,107 +300,139 @@ export default function CreatePage() {
         if (reference) setPrompt((current) => removeReferenceTokens(current, [reference]));
     };
 
-    const submit = async (retry?: { source: CreationMessage; sourceIndex: number }) => {
-        const source = retry?.source;
-        const requestMode = source?.mode || mode;
-        const requestModel = source?.model || selectedModel;
-        const requestSettings = source?.settings || { ratio, seconds, quality, videoQuality, count };
-        const requestAttachments = source?.attachments || attachments;
-        const text = (source?.content || prompt).trim();
+    const submit = async () => {
+        const text = prompt.trim();
         if (!text || busy || !activeConversation) return;
-        if (!requestModel) {
-            toast.warning(`请先在设置中配置${modeLabels[requestMode]}模型`);
+        if (!selectedModel) {
+            toast.warning(`请先在设置中配置${modeLabels[mode]}模型`);
             return;
         }
-        const references = source?.references || selectedCreationReferences(text, mentionReferences);
-        const expandedPrompt = expandCreationPrompt(text, references, requestAttachments);
-        const requestVideoProfile = requestMode === "video" ? modelCapabilityConfigFor(config, requestModel).video! : undefined;
-        if (requestMode === "video" && !videoDurationAllowed(requestVideoProfile!, Number(requestSettings.seconds))) {
+        if (mode === "video" && !videoDurationAllowed(videoProfile, Number(seconds))) {
             toast.error("当前模型不支持所选视频时长，请重新选择");
             return;
         }
-        if (requestMode === "video" && Array.from(text).length > requestVideoProfile!.references.promptMaxChars) {
-            toast.error(`提示词超过当前模型限制（最多 ${requestVideoProfile!.references.promptMaxChars} 字）`);
+        if (mode === "video" && Array.from(text).length > videoProfile.references.promptMaxChars) {
+            toast.error(`提示词超过当前模型限制（最多 ${videoProfile.references.promptMaxChars} 字）`);
             return;
         }
-        // 后端为图片和视频参考使用不同字段，重试时也必须按保存的附件重新拆分。
-        const referenceImages = requestAttachments.filter(isImageAttachment);
-        const referenceVideos = requestAttachments.filter(isVideoAttachment);
-        if (requestMode === "video" && Array.from(expandedPrompt).length > requestVideoProfile!.references.promptMaxChars) {
-            toast.error(`引用展开后提示词超过当前模型限制（最多 ${requestVideoProfile!.references.promptMaxChars} 字）`);
+        if (mode === "image" && Array.from(text).length > imageProfile.references.promptMaxChars) {
+            toast.error(`提示词超过当前模型限制（最多 ${imageProfile.references.promptMaxChars} 字）`);
+            return;
+        }
+        const settings = { ratio, seconds, quality, videoQuality, count };
+        const references = selectedCreationReferences(text, mentionReferences);
+        // 后端对图片和视频使用不同的参考字段；这里先拆分，避免媒体类型在写入任务时被误判。
+        const referenceImages = attachments.filter(isImageAttachment);
+        const referenceVideos = attachments.filter(isVideoAttachment);
+        const expandedPrompt = expandCreationPrompt(text, references, attachments);
+        if (mode === "video" && Array.from(expandedPrompt).length > videoProfile.references.promptMaxChars) {
+            toast.error(`引用展开后提示词超过当前模型限制（最多 ${videoProfile.references.promptMaxChars} 字）`);
+            return;
+        }
+        if (mode === "image" && Array.from(expandedPrompt).length > imageProfile.references.promptMaxChars) {
+            toast.error(`引用展开后提示词超过当前模型限制（最多 ${imageProfile.references.promptMaxChars} 字）`);
             return;
         }
         const referenceMetadata = creationReferenceMetadata(references);
         followLatestMessageRef.current = true;
-        const userMessage = source || newMessage("user", text, { mode: requestMode, model: requestModel, attachments: requestAttachments, references, settings: requestSettings });
-        const taskCount = requestMode === "image" ? Math.max(1, Math.min(15, Math.floor(Number(requestSettings.count) || 1))) : 1;
-        const submissionIds = Array.from({ length: taskCount }, () => createClientId());
-        const assistantMessage = newMessage("assistant", "", { mode: requestMode, model: requestModel, status: "pending", settings: requestSettings, submissionIds });
+        const userMessage = newMessage("user", text, { mode, model: selectedModel, attachments, references, settings });
+        const assistantMessage = newMessage("assistant", "", { mode, model: selectedModel, status: mode === "text" ? "streaming" : "pending", settings });
         const boundTaskIds = new Set<string>();
+        const boundTaskIdsByBatchIndex = new Map<number, string>();
         const bindTask = (task: GenerationTask) => {
+            if (typeof task.clientContext?.batchIndex === "number") boundTaskIdsByBatchIndex.set(task.clientContext.batchIndex, task.id);
             if (boundTaskIds.has(task.id)) return;
             boundTaskIds.add(task.id);
             updateAssistant(assistantMessage.id, (item) => ({ ...item, taskIds: Array.from(new Set([...(item.taskIds || []), task.id])) }));
         };
-        const nextConversations = conversations.map((conversation) => conversation.id === activeConversation.id ? {
+        updateActive((conversation) => ({
             ...conversation,
             title: conversation.messages.length ? conversation.title : text.slice(0, 24),
             updatedAt: new Date().toISOString(),
-            messages: source ? [...conversation.messages, assistantMessage] : [...conversation.messages, userMessage, assistantMessage],
-        } : conversation);
-        setConversations(nextConversations);
-        conversationsRef.current = nextConversations;
-        if (!source) {
-            setPrompt("");
-            setAttachments([]);
-            setDraftReferences([]);
-        }
-        setSubmitting(true);
-        const requestConfig = { ...config, model: requestModel, imageModel: requestModel, videoModel: requestModel, textModel: requestModel, size: requestSettings.ratio, videoSeconds: requestSettings.seconds, quality: requestSettings.quality, vquality: requestSettings.videoQuality, count: requestSettings.count };
+            messages: [...conversation.messages, userMessage, assistantMessage],
+        }));
+        setPrompt("");
+        setAttachments([]);
+        setDraftReferences([]);
+        setBusy(true);
+        const controller = new AbortController();
+        abortRef.current = controller;
+        const requestConfig = { ...config, model: selectedModel, imageModel: selectedModel, videoModel: selectedModel, textModel: selectedModel, size: ratio, videoSeconds: seconds, quality, vquality: videoQuality, count };
         try {
-            await localforage.setItem(STORAGE_KEY, nextConversations);
-            if (requestMode === "text") {
-                await submitBackendGenerationTask({
-                    submissionId: submissionIds[0],
-                    mode: "text",
-                    prompt: creationTextTaskPrompt(retry ? activeConversation.messages.slice(0, retry.sourceIndex) : activeConversation.messages, userMessage),
-                    config: requestConfig,
-                    referenceImages,
-                    metadata: { source: "create-page", conversationId: activeConversation.id, messageId: assistantMessage.id, submissionId: submissionIds[0], ...referenceMetadata },
-                    onTaskUpdate: bindTask,
-                });
-            } else if (requestMode === "image") {
-                await submitBackendGenerationTaskBatch({
+            if (mode === "text") {
+                const history = [...(activeConversation.messages || []), userMessage].map((item) => ({
+                    role: item.role,
+                    content: item.role === "user"
+                        ? buildTextMessageContent(item)
+                        : item.content,
+                }));
+                await requestImageQuestion(requestConfig, history, (text) => updateAssistant(assistantMessage.id, (item) => ({ ...item, content: text })), { signal: controller.signal });
+            } else if (mode === "image") {
+                const taskCount = Math.max(1, Math.min(imageProfile.maxOutputs, Math.floor(Number(count) || 1)));
+                const settled = await runBackendGenerationTaskBatch({
                     mode: "image",
                     prompt: expandedPrompt,
                     config: { ...requestConfig, count: "1" },
                     referenceImages,
-                    submissionIds,
+                    signal: controller.signal,
                     metadata: { source: "create-page", conversationId: activeConversation.id, messageId: assistantMessage.id, ...referenceMetadata },
                     onTaskUpdate: bindTask,
                     count: taskCount,
                 });
+                if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+                const boundTaskIdList = Array.from(boundTaskIds);
+                const generatedImages = settled.flatMap((entry, batchIndex) => {
+                    if (entry.status !== "fulfilled") return [];
+                    return (entry.value.images || []).map((image, resultIndex) => ({
+                        image,
+                        taskId: boundTaskIdsByBatchIndex.get(batchIndex) || boundTaskIdList[batchIndex],
+                        resultIndex,
+                    }));
+                });
+                const taskFailures = settled.filter((entry): entry is PromiseRejectedResult => entry.status === "rejected");
+                const storedImages = await Promise.allSettled(generatedImages.map(async ({ image, taskId, resultIndex }) => {
+                    const uploaded = await persistCreationImageResult(image);
+                    addCreationAssetOnce(creationImageAsset({ title: expandedPrompt.slice(0, 24), uploaded, metadata: { source: "create-generation", conversationId: activeConversation.id, messageId: assistantMessage.id, taskId, taskIds: boundTaskIdList, resultIndex, prompt: expandedPrompt } }), { taskId, messageId: assistantMessage.id, resultIndex });
+                    return uploaded.url;
+                }));
+                const resultUrls = storedImages.flatMap((entry) => entry.status === "fulfilled" ? [entry.value] : []);
+                const resourceFailures = storedImages.filter((entry) => entry.status === "rejected");
+                const failedCount = taskFailures.length + resourceFailures.length;
+                if (!resultUrls.length) {
+                    const reason = taskFailures[0]?.reason || resourceFailures[0]?.reason;
+                    throw reason instanceof Error ? reason : new Error("后端任务没有返回图片");
+                }
+                if (failedCount) toast.warning(`${resultUrls.length} 张图片已生成，${failedCount} 张生成失败`);
+                updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "done", content: failedCount ? `${resultUrls.length} 张图片已生成，${failedCount} 张失败` : "图片已生成", resultUrls }));
             } else {
-                await submitBackendGenerationTask({
-                    submissionId: submissionIds[0],
+                const result = await runBackendGenerationTask({
                     mode: "video",
                     prompt: expandedPrompt,
                     config: requestConfig,
                     referenceImages,
                     referenceVideos,
-                    metadata: { source: "create-page", conversationId: activeConversation.id, messageId: assistantMessage.id, submissionId: submissionIds[0], videoEditOperation: requestAttachments.length ? "image_to_video" : "text_to_video", ...referenceMetadata },
+                    signal: controller.signal,
+                    metadata: { source: "create-page", conversationId: activeConversation.id, messageId: assistantMessage.id, videoEditOperation: attachments.length ? "image_to_video" : "text_to_video", ...referenceMetadata },
                     onTaskUpdate: bindTask,
                 });
+                if (!result.video?.dataUrl) throw new Error("后端任务没有返回视频");
+                const storedVideo = await storeGeneratedVideo({ url: result.video.dataUrl, mimeType: result.video.mimeType || "video/mp4" });
+                if (!storedVideo.url) throw new Error("视频结果资源不可用");
+                const taskId = Array.from(boundTaskIds)[0];
+                addCreationAssetOnce(creationVideoAsset({ title: expandedPrompt.slice(0, 24), uploaded: storedVideo, metadata: { source: "create-generation", conversationId: activeConversation.id, messageId: assistantMessage.id, taskId, taskIds: Array.from(boundTaskIds), resultIndex: 0, prompt: expandedPrompt } }), { taskId, messageId: assistantMessage.id, resultIndex: 0 });
+                updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "done", content: "视频已生成", resultUrls: [storedVideo.url] }));
             }
+            updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "done" }));
         } catch (error) {
-            if (isGenerationTaskSubmissionUncertain(error)) {
-                toast.info("未收到提交确认，正在恢复任务状态");
+            if (controller.signal.aborted) {
+                updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "cancelled", content: "已停止" }));
                 return;
             }
             const message = generationErrorMessage(error);
-            updateAssistant(assistantMessage.id, (item) => boundTaskIds.size ? item : ({ ...item, status: "error", error: message, content: item.content || "生成失败" }));
+            updateAssistant(assistantMessage.id, (item) => ({ ...item, status: "error", error: message, content: "生成失败" }));
         } finally {
-            setSubmitting(false);
+            abortRef.current = null;
+            setBusy(false);
         }
     };
 
@@ -477,32 +473,27 @@ export default function CreatePage() {
     };
 
     const retryFailedMessage = (item: CreationMessage, index: number) => {
-        const sourceIndex = item.role === "assistant" ? index - 1 : index;
-        const previous = activeConversation?.messages[sourceIndex];
-        if (!previous?.content || previous.role !== "user" || busy) return;
+        const previous = item.role === "assistant" ? activeConversation?.messages[index - 1] : item;
+        if (!previous?.content || busy) return;
         followLatestMessageRef.current = true;
-        void submit({ source: previous, sourceIndex });
+        restoreMessageDraft(previous);
+        const removedIds = new Set([item.id, previous.id]);
+        updateActive((conversation) => {
+            const messages = conversation.messages.filter((message) => !removedIds.has(message.id));
+            const firstPrompt = messages.find((message) => message.role === "user")?.content.trim();
+            return {
+                ...conversation,
+                title: firstPrompt ? firstPrompt.slice(0, 24) : "新创作",
+                updatedAt: new Date().toISOString(),
+                messages,
+            };
+        });
     };
 
     const createVariant = (item: CreationMessage, index: number) => {
         const previous = item.role === "assistant" ? activeConversation?.messages[index - 1] : item;
         if (!previous?.content || busy) return;
         restoreMessageDraft(previous);
-    };
-
-    const stopActiveGeneration = async () => {
-        if (!activeConversation) return;
-        const taskIds = Array.from(new Set(activeConversation.messages
-            .filter(isCreationInProgress)
-            .flatMap((item) => item.taskIds || [])));
-        if (!taskIds.length) {
-            toast.info("任务正在提交，提交完成后可停止");
-            return;
-        }
-        const settled = await Promise.allSettled(taskIds.map((taskID) => cancelGenerationTask(taskID)));
-        const tasks = settled.flatMap((entry) => entry.status === "fulfilled" ? [entry.value] : []);
-        if (tasks.length) setConversations((current) => reconcileCreationTaskMessages(current, tasks));
-        if (tasks.length !== taskIds.length) toast.warning("部分任务暂时无法停止，请稍后重试");
     };
 
     if (!hydrated || !activeConversation) return <div className="grid h-full place-items-center"><Spin /></div>;
@@ -526,6 +517,7 @@ export default function CreatePage() {
         onFileChange: handleFileChange,
         onModeChange: selectMode,
         model: selectedModel,
+        imageProfile,
         videoProfile,
         config,
         onModelChange: (value: string) => updateConfig(mode === "text" ? "textModel" : mode === "image" ? "imageModel" : "videoModel", value),
@@ -540,7 +532,7 @@ export default function CreatePage() {
         count,
         setCount,
         onSubmit: submit,
-        onStop: () => void stopActiveGeneration(),
+        onStop: () => abortRef.current?.abort(),
     };
 
     return <>
@@ -666,10 +658,8 @@ function CreationHistoryDrawer({ open, conversations, activeId, onClose, onSelec
 function CreationMessageView({ item, modelName, onRetryFailure, onCreateVariant }: { item: CreationMessage; modelName: string; onRetryFailure: () => void; onCreateVariant: () => void }) {
     if (item.role === "user") return <CreationUserMessage item={item} />;
     const mode = item.mode || "text";
-    const stateLabel = isCreationInProgress(item) ? "生成中" : item.status === "cancelled" ? "已停止" : item.status === "draft" ? "未完成草稿" : "";
-    const emptyText = isCreationInProgress(item) ? "正在生成…" : item.status === "cancelled" ? "已停止" : item.status === "draft" ? "未完成草稿" : "暂无内容";
-    const retryable = item.status === "error" || item.status === "cancelled" || item.status === "draft";
-    return <article className="creation-assistant-message"><div className="creation-message-heading"><span className="creation-message-mark"><Sparkles /></span><span>{modeLabels[mode]}</span>{modelName ? <span className="creation-message-model">{modelName}</span> : null}{stateLabel ? <span className={`creation-message-state is-${item.status}`}>{stateLabel}</span> : null}</div>{mode === "text" ? <div className="creation-message-content">{item.content ? <ReactMarkdown>{item.content}</ReactMarkdown> : <span>{emptyText}</span>}</div> : <MediaResult item={item} onRetryFailure={onRetryFailure} onCreateVariant={onCreateVariant} />}{item.error ? <div className="creation-message-error"><span>{generationErrorMessage(item.error)}</span><button type="button" onClick={onRetryFailure}><RefreshCw />重新生成</button></div> : retryable ? <div className="creation-message-error"><button type="button" onClick={onRetryFailure}><RefreshCw />重新生成</button></div> : null}</article>;
+    const stateLabel = item.status === "pending" ? "生成中" : item.status === "cancelled" ? "已停止" : "";
+    return <article className="creation-assistant-message"><div className="creation-message-heading"><span className="creation-message-mark"><Sparkles /></span><span>{modeLabels[mode]}</span>{modelName ? <span className="creation-message-model">{modelName}</span> : null}{stateLabel ? <span className={`creation-message-state is-${item.status}`}>{stateLabel}</span> : null}</div>{mode === "text" ? <div className="creation-message-content">{item.content ? <ReactMarkdown>{item.content}</ReactMarkdown> : <span>正在生成…</span>}</div> : <MediaResult item={item} onRetryFailure={onRetryFailure} onCreateVariant={onCreateVariant} />}{item.error ? <div className="creation-message-error"><span>{generationErrorMessage(item.error)}</span><button type="button" onClick={onRetryFailure}><RefreshCw />重新生成</button></div> : null}</article>;
 }
 
 function CreationUserMessage({ item }: { item: CreationMessage }) {
@@ -693,7 +683,7 @@ function MediaResult({ item, onRetryFailure, onCreateVariant }: { item: Creation
     const [previewType, setPreviewType] = useState<"image" | "video">("image");
     const resultUrls = item.resultUrls;
     const openPreview = (url: string, type: "image" | "video") => { setPreviewType(type); setPreviewUrl(url); };
-    if (isCreationInProgress(item)) return <div className="creation-media-pending"><Spin size="small" />正在生成{item.mode === "video" ? "视频" : "图片"}…</div>;
+    if (item.status === "pending") return <div className="creation-media-pending"><Spin size="small" />正在生成{item.mode === "video" ? "视频" : "图片"}…</div>;
     if ((item.status === "error" || item.status === "cancelled") && !resultUrls?.length) return null;
     if (!resultUrls?.length) return <div className="creation-media-empty">没有返回可预览结果 <button type="button" onClick={onRetryFailure}>重试</button></div>;
     return <div className="creation-media-result">{item.mode === "video" ? <button type="button" className="creation-video-result" onClick={() => openPreview(resultUrls[0], "video")} aria-label="预览生成视频"><video muted preload="metadata" className="size-full object-cover" src={resultUrls[0]} /><span><Maximize2 />预览视频</span></button> : <div className="creation-image-result-grid">{resultUrls.map((url) => <button key={url} type="button" className="creation-image-result" onClick={() => openPreview(url, "image")} aria-label="预览生成图片"><img src={url} alt="生成结果" /><span><Maximize2 /></span></button>)}</div>}<div className="creation-media-actions"><span>{item.mode === "video" ? "视频结果" : `${resultUrls.length} 张图片`}</span><button type="button" onClick={onCreateVariant}><RefreshCw />生成变体</button><Link to="/canvas">添加到画布</Link>{resultUrls.map((url, index) => <a key={`${url}-download`} href={url} download>{resultUrls.length > 1 ? `下载 ${index + 1}` : <><Download />下载</>}</a>)}</div><CreationMediaPreviewModal url={previewUrl} type={previewType} onClose={() => setPreviewUrl("")} /></div>;
@@ -718,6 +708,7 @@ type ComposerProps = {
     onModeChange: (mode: CreationMode) => void;
     model: string;
     videoProfile: VideoCapabilityConfig;
+    imageProfile: ImageCapabilityConfig;
     config: ReturnType<typeof useEffectiveConfig>;
     onModelChange: (value: string) => void;
     ratio: string;
@@ -742,20 +733,27 @@ function CreationComposer(props: ComposerProps) {
             ? "描述画面、人物、场景、构图与风格"
             : "描述镜头内容、运动、光线与节奏";
     const emptyPlaceholder = "输入你的镜头、画面或故事。也可以添加参考图开始创作";
+    const imageReferencesSupported = props.imageProfile.references.maxImages > 0;
+    const referencesSupported = props.mode === "image" ? imageReferencesSupported : props.mode !== "video" || props.videoProfile.operations.includes("image_to_video");
+    const imageSettingsSupported = props.imageProfile.size.parameter !== "none" || props.imageProfile.quality.supported || props.imageProfile.maxOutputs > 1;
     return <section className={`creation-chat-composer is-${props.variant}`}>
         <div className="creation-chat-writing-surface">
             <input ref={props.fileInputRef} type="file" hidden accept={props.mode === "video" ? "image/*,video/*" : "image/*"} multiple onChange={props.onFileChange} />
-            <Tooltip title={props.mode === "video" && !props.videoProfile.operations.includes("image_to_video") ? "当前模型不支持参考媒体" : "从素材库选择参考内容"}><button type="button" className="creation-chat-reference is-paper" onClick={props.onOpenLibrary} disabled={props.busy || (props.mode === "video" && !props.videoProfile.operations.includes("image_to_video"))} aria-label="打开素材库选择参考内容"><Plus /><span>参考内容</span></button></Tooltip>
+            <Tooltip title={!referencesSupported ? "当前模型不支持参考媒体" : "从素材库选择参考内容"}><button type="button" className="creation-chat-reference is-paper" onClick={props.onOpenLibrary} disabled={props.busy || !referencesSupported} aria-label="打开素材库选择参考内容"><Plus /><span>参考内容</span></button></Tooltip>
             <div className="creation-chat-editor">
-                <CanvasResourceMentionTextarea value={props.prompt} references={props.references} maxLength={props.mode === "video" ? props.videoProfile.references.promptMaxChars : undefined} mentionMenuWidth={400} sendOnEnter={false} onChange={props.setPrompt} onSubmit={props.onSubmit} containerClassName="creation-chat-mention-container" className="creation-chat-mention-editor creation-scrollbar" style={{ color: "var(--creation-text)" }} placeholder={props.variant === "empty" ? emptyPlaceholder : placeholder} aria-label="创作提示词，可使用 @ 引用当前参考内容或技能" spellCheck disabled={props.busy} />
+                <CanvasResourceMentionTextarea value={props.prompt} references={props.references} maxLength={props.mode === "video" ? props.videoProfile.references.promptMaxChars : props.mode === "image" ? props.imageProfile.references.promptMaxChars : undefined} mentionMenuWidth={400} sendOnEnter={false} onChange={props.setPrompt} onSubmit={props.onSubmit} containerClassName="creation-chat-mention-container" className="creation-chat-mention-editor creation-scrollbar" style={{ color: "var(--creation-text)" }} placeholder={props.variant === "empty" ? emptyPlaceholder : placeholder} aria-label="创作提示词，可使用 @ 引用当前参考内容或技能" spellCheck disabled={props.busy} />
                 {props.attachments.length ? <div className="creation-chat-attachment-strip">{props.attachments.map((item) => <div key={item.id} className="creation-chat-attachment">{isVideoAttachment(item) ? <video src={item.url} poster={item.previewUrl !== item.url ? item.previewUrl : undefined} muted playsInline preload="metadata" aria-label={item.name} /> : <img src={item.previewUrl} alt={item.name} /> }<button type="button" onClick={() => props.onRemoveAttachment(item.id)} aria-label={`移除 ${item.name}`}><X /></button></div>)}</div> : null}
             </div>
         </div>
         <footer className="creation-chat-dock">
             <div className="creation-chat-controls">
+                <VoiceRecordingButton
+                    disabled={props.busy}
+                    onTranscribed={(text) => props.setPrompt(props.prompt.trim() ? `${props.prompt} ${text}` : text)}
+                />
                 <ModePicker mode={props.mode} onModeChange={props.onModeChange} />
                 <ModelPicker config={props.config} value={props.model} onChange={props.onModelChange} capability={props.mode} className="creation-model-picker" placeholder={`选择${modeLabels[props.mode]}模型`} showSelectedPrice={false} variant="creation" />
-                {props.mode !== "text" ? <GenerationSettingsMenu {...props} /> : null}
+                {props.mode === "video" || (props.mode === "image" && imageSettingsSupported) ? <GenerationSettingsMenu {...props} /> : null}
                 {props.mode === "video" ? <DurationMenu profile={props.videoProfile} seconds={props.seconds} onChange={props.setSeconds} /> : null}
             </div>
             {props.busy ? <button type="button" className="creation-chat-submit is-stopping" onClick={props.onStop} aria-label="停止生成"><Square className="size-3.5 fill-current" /></button> : <button type="button" className="creation-chat-submit" disabled={!canSubmit} onClick={props.onSubmit} aria-label="发送"><ArrowUp className="size-4" /></button>}
@@ -780,14 +778,19 @@ function GenerationSettingsMenu(props: ComposerProps) {
     const [open, setOpen] = useState(false);
     const [customRatioOpen, setCustomRatioOpen] = useState(!ratioOptions.some((option) => option.value === props.ratio));
     const qualityLabel = qualityOptions.find((item) => item.value === props.quality)?.label || "自动";
-    const ratios = props.mode === "video" ? props.videoProfile.ratios : ratioOptions.map((item) => item.value);
+    const ratios = props.mode === "video" ? props.videoProfile.ratios : props.imageProfile.size.values.length ? props.imageProfile.size.values : ratioOptions.map((item) => item.value);
     const resolutions = props.mode === "video" ? props.videoProfile.resolutions.map((value) => ({ value: value.replace(/p$/i, ""), label: videoResolutionLabel(value) })) : resolutionOptions;
-    const summary = props.mode === "video" ? `${props.ratio} · ${videoResolutionLabel(props.videoQuality)}` : `${props.ratio} · ${qualityLabel} · ${props.count}`;
+    const imageSummary = [
+        ...(props.imageProfile.size.parameter !== "none" ? [props.ratio] : []),
+        ...(props.imageProfile.quality.supported ? [qualityLabel] : []),
+        ...(props.imageProfile.maxOutputs > 1 ? [props.count] : []),
+    ].join(" · ");
+    const summary = props.mode === "video" ? `${props.ratio} · ${videoResolutionLabel(props.videoQuality)}` : imageSummary;
     const panel = <div className="creation-parameter-menu">
-        <SettingSection title="画幅" value={props.ratio}><div className="creation-parameter-content"><div className="creation-choice-grid is-ratio">{ratios.map((value) => <button key={value} type="button" aria-pressed={value === props.ratio} className={value === props.ratio ? "is-selected" : ""} onClick={() => { props.setRatio(value); setCustomRatioOpen(false); }}><span className="creation-ratio-preview"><span style={ratioPreviewStyle(value)} /></span><span>{value}</span></button>)}</div>{props.mode !== "video" && (customRatioOpen ? <label className="creation-custom-value"><span>宽 : 高</span><input value={props.ratio} onFocus={(event) => event.currentTarget.select()} onChange={(event) => props.setRatio(event.target.value)} placeholder="1920x1080 或 2:1" aria-label="自定义画幅，支持宽x高或比例" /></label> : <button type="button" className="creation-custom-trigger" onClick={() => setCustomRatioOpen(true)}><Plus />输入自定义比例</button>)}</div></SettingSection>
+        {props.mode === "video" || props.imageProfile.size.parameter !== "none" ? <SettingSection title="画幅" value={props.ratio}><div className="creation-parameter-content"><div className="creation-choice-grid is-ratio">{ratios.map((value) => <button key={value} type="button" aria-pressed={value === props.ratio} className={value === props.ratio ? "is-selected" : ""} onClick={() => { props.setRatio(value); setCustomRatioOpen(false); }}><span className="creation-ratio-preview"><span style={ratioPreviewStyle(value)} /></span><span>{value}</span></button>)}</div>{props.mode !== "video" && props.imageProfile.size.allowCustom && (customRatioOpen ? <label className="creation-custom-value"><span>宽 : 高</span><input value={props.ratio} onFocus={(event) => event.currentTarget.select()} onChange={(event) => props.setRatio(event.target.value)} placeholder="1920x1080 或 2:1" aria-label="自定义画幅，支持宽x高或比例" /></label> : <button type="button" className="creation-custom-trigger" onClick={() => setCustomRatioOpen(true)}><Plus />输入自定义比例</button>)}</div></SettingSection> : null}
         {props.mode === "video" ? <SettingSection title="清晰度" value={videoResolutionLabel(props.videoQuality)}><div className="creation-choice-grid is-resolution">{resolutions.map((option) => <button key={option.value} type="button" aria-pressed={option.value === props.videoQuality} className={option.value === props.videoQuality ? "is-selected" : ""} onClick={() => props.setVideoQuality(option.value)}>{option.label}</button>)}</div></SettingSection> : <>
-            <SettingSection title="图片质量" value={qualityLabel}><div className="creation-choice-grid is-quality">{qualityOptions.map((option) => <button key={option.value} type="button" aria-pressed={option.value === props.quality} className={option.value === props.quality ? "is-selected" : ""} onClick={() => props.setQuality(option.value)}><span>{option.label}</span><small>{option.description}</small></button>)}</div></SettingSection>
-            <SettingSection title="生成数量" value={`${props.count} 张`}><div className="creation-parameter-content"><div className="creation-choice-grid is-count">{countOptions.map((option) => <button key={option} type="button" aria-pressed={option === props.count} className={option === props.count ? "is-selected" : ""} onClick={() => props.setCount(option)}>{option}</button>)}</div><label className="creation-custom-value"><span>自定义</span><input inputMode="numeric" pattern="[0-9]*" value={props.count} onChange={(event) => props.setCount(event.target.value)} aria-label="生成数量，范围 1 到 15" /><em>张</em></label></div></SettingSection>
+            {props.imageProfile.quality.supported ? <SettingSection title="图片质量" value={qualityLabel}><div className="creation-choice-grid is-quality">{qualityOptions.filter((option) => props.imageProfile.quality.values.includes(option.value)).map((option) => <button key={option.value} type="button" aria-pressed={option.value === props.quality} className={option.value === props.quality ? "is-selected" : ""} onClick={() => props.setQuality(option.value)}><span>{option.label}</span><small>{option.description}</small></button>)}</div></SettingSection> : null}
+            {props.imageProfile.maxOutputs > 1 ? <SettingSection title="生成数量" value={`${props.count} 张`}><div className="creation-parameter-content"><div className="creation-choice-grid is-count">{countOptions.filter((option) => Number(option) <= props.imageProfile.maxOutputs).map((option) => <button key={option} type="button" aria-pressed={option === props.count} className={option === props.count ? "is-selected" : ""} onClick={() => props.setCount(option)}>{option}</button>)}</div><label className="creation-custom-value"><span>自定义</span><input inputMode="numeric" pattern="[0-9]*" value={props.count} onChange={(event) => props.setCount(String(Math.max(1, Math.min(props.imageProfile.maxOutputs, Number(event.target.value) || 1))))} aria-label={`生成数量，范围 1 到 ${props.imageProfile.maxOutputs}`} /><em>张</em></label></div></SettingSection> : null}
         </>}
     </div>;
     return <Popover open={open} onOpenChange={setOpen} trigger="click" placement="bottom" arrow={false} classNames={{ root: "creation-control-popover", container: "creation-control-popover-surface", content: "creation-control-popover-content" }} content={panel}>
@@ -801,11 +804,18 @@ function SettingSection({ title, value, children }: { title: string; value?: str
 
 function DurationMenu({ profile, seconds, onChange }: { profile: VideoCapabilityConfig; seconds: string; onChange: (value: string) => void }) {
     const [open, setOpen] = useState(false);
-    const value = Math.max(1, Math.floor(Number(seconds) || profile.duration.default));
-    const presets = videoDurationOptions(profile);
-    const min = profile.duration.selection === "range" ? profile.duration.min || 1 : Math.min(...presets);
-    const max = profile.duration.selection === "range" ? profile.duration.max || min : Math.max(...presets);
-    return <Popover open={open} onOpenChange={setOpen} trigger="click" placement="bottom" arrow={false} classNames={{ root: "creation-control-popover", container: "creation-control-popover-surface", content: "creation-control-popover-content" }} content={<div className="creation-duration-menu"><div className="creation-duration-heading"><span>时长</span><strong>{value} 秒</strong></div><div className="creation-duration-choices">{presets.map((item) => <button key={item} type="button" className={item === value ? "is-selected" : ""} onClick={() => onChange(String(item))}>{item}s</button>)}</div>{profile.duration.selection === "range" ? <label className="creation-custom-value is-duration"><span>自定义时长</span><span className="creation-duration-custom-field"><input type="number" min={min} max={max} step={profile.duration.step || 1} inputMode="numeric" value={seconds} onFocus={(event) => event.currentTarget.select()} onBlur={() => onChange(String(value))} onChange={(event) => onChange(event.target.value)} aria-label="自定义视频时长，单位秒" /><em>秒</em></span></label> : null}</div>}>
+    const value = Number(normalizeVideoValue(profile, { seconds }).seconds);
+    const presets = profile.duration.selection === "enum" ? videoDurationOptions(profile) : [];
+    const fallbackPreset = presets.length ? presets : [profile.duration.default];
+    const min = profile.duration.selection === "range" ? profile.duration.min || 1 : Math.min(...fallbackPreset);
+    const max = profile.duration.selection === "range" ? Math.max(min, profile.duration.max || min) : Math.max(...fallbackPreset);
+    const step = Math.max(1, profile.duration.step || 1);
+    const durationControl = profile.duration.selection === "range" ? <>
+        <input className="h-8 w-full" style={{ accentColor: "var(--creation-text)" }} type="range" min={min} max={max} step={step} value={value} aria-label="视频时长（秒）" onChange={(event) => onChange(event.target.value)} />
+        <div className="flex justify-between px-0.5 text-[var(--fs-tiny)] text-[var(--creation-muted)]"><span>{min}s</span><span>{max}s</span></div>
+        <label className="creation-custom-value is-duration"><span>自定义时长</span><span className="creation-duration-custom-field"><input type="number" min={min} max={max} step={step} inputMode="numeric" value={seconds} onFocus={(event) => event.currentTarget.select()} onBlur={() => onChange(String(value))} onChange={(event) => onChange(event.target.value)} aria-label="自定义视频时长，单位秒" /><em>秒</em></span></label>
+    </> : <div className="creation-duration-choices">{presets.map((item) => <button key={item} type="button" className={item === value ? "is-selected" : ""} onClick={() => onChange(String(item))}>{item}s</button>)}</div>;
+    return <Popover open={open} onOpenChange={setOpen} trigger="click" placement="bottom" arrow={false} classNames={{ root: "creation-control-popover", container: "creation-control-popover-surface", content: "creation-control-popover-content" }} content={<div className="creation-duration-menu"><div className="creation-duration-heading"><span>时长</span><strong>{value} 秒</strong></div>{durationControl}</div>}>
         <button type="button" className="creation-chat-control is-duration" aria-label={`视频时长：${value}秒`}><Clock3 /><span>{value}s</span><ChevronDown className={open ? "is-open" : ""} /></button>
     </Popover>;
 }
@@ -863,6 +873,13 @@ function conversationPreviewMessage(conversation: CreationConversation) {
     return fallback;
 }
 
+function buildTextMessageContent(item: CreationMessage) {
+    const content = expandCreationPrompt(item.content, item.references || [], item.attachments || []);
+    const images = (item.attachments || []).filter(isImageAttachment);
+    if (!images.length) return content;
+    return [{ type: "text" as const, text: content }, ...images.map((image) => ({ type: "image_url" as const, image_url: { url: image.dataUrl || image.url || "" } }))];
+}
+
 function isVideoAttachment(attachment: CreationAttachment): attachment is CreationAttachment & { url: string } {
     return attachment.type.startsWith("video/");
 }
@@ -875,146 +892,39 @@ function removeReferenceTokens(value: string, references: CreationReference[]) {
     return references.reduce((current, reference) => current.split(canvasResourceMentionToken(reference)).join(""), value);
 }
 
-function migrateCreationConversations(conversations: CreationConversation[]) {
-    return conversations.map((conversation) => ({
-        ...conversation,
-        messages: conversation.messages.map((message) => message.role === "assistant" && message.status === "streaming" && !(message.taskIds?.length || message.submissionIds?.length)
-            ? { ...message, status: "draft" as const }
-            : message.role === "assistant" && message.status === "error" && message.error === "任务已结束，但生成结果暂时无法读取" && Boolean(message.taskIds?.length)
-                ? { ...message, status: "pending" as const }
-            : message),
+function pendingCreationMediaKey(conversations: CreationConversation[]) {
+    return conversations.flatMap((conversation) => conversation.messages.flatMap((message) => message.role === "assistant" && message.status === "pending" && message.mode !== "text" ? [`${conversation.id}:${message.id}:${(message.taskIds || []).join(",")}`] : [])).join("|");
+}
+
+function pendingCreationTaskIds(conversations: CreationConversation[]) {
+    const taskIds = conversations.flatMap((conversation) => conversation.messages.flatMap((message) => {
+        if (message.role !== "assistant" || message.status !== "pending" || message.mode === "text") return [];
+        return message.taskIds || [];
     }));
+    return Array.from(new Set(taskIds));
 }
 
-function isCreationInProgress(message: CreationMessage) {
-    return message.role === "assistant" && (message.status === "pending" || message.status === "streaming");
-}
-
-function pendingCreationTaskKey(conversations: CreationConversation[]) {
-    return conversations.flatMap((conversation) => conversation.messages.flatMap((message) => isCreationInProgress(message)
-        ? [`${conversation.id}:${message.id}:${(message.taskIds || []).join(",")}:${(message.submissionIds || []).join(",")}`]
-        : [])).join("|");
-}
-
-function creationPendingTaskIds(conversations: CreationConversation[]) {
-    return Array.from(new Set(conversations.flatMap((conversation) => conversation.messages.flatMap((message) => isCreationInProgress(message) ? (message.taskIds || []) : []))));
-}
-
-function creationPendingSubmissionIds(conversations: CreationConversation[]) {
-    return Array.from(new Set(conversations.flatMap((conversation) => conversation.messages.flatMap((message) => isCreationInProgress(message) ? (message.submissionIds || []) : []))));
-}
-
-function hasLegacyPendingCreationMessage(conversations: CreationConversation[]) {
-    return conversations.some((conversation) => conversation.messages.some((message) => isCreationInProgress(message) && !(message.taskIds?.length || message.submissionIds?.length)));
-}
-
-function activeCreationTextTaskKey(conversation?: CreationConversation) {
-    return activeCreationTextTasks(conversation).map((task) => task.id).join("|");
-}
-
-function activeCreationTextTasks(conversation?: CreationConversation) {
-    if (!conversation) return [] as Array<{ id: string; cursor: number; task: GenerationTask }>;
-    const result: Array<{ id: string; cursor: number; task: GenerationTask }> = [];
-    for (const message of conversation.messages) {
-        if (!isCreationInProgress(message) || message.mode !== "text") continue;
-        for (const id of message.taskIds || []) {
-            result.push({ id, cursor: message.textCursors?.[id] || 0, task: { id } as GenerationTask });
-        }
-    }
-    return result;
-}
-
-function creationTextCursor(conversations: CreationConversation[], taskID: string) {
-    for (const conversation of conversations) {
-        for (const message of conversation.messages) {
-            if (message.taskIds?.includes(taskID)) return message.textCursors?.[taskID] || 0;
-        }
-    }
-    return 0;
-}
-
-function attachRecoveredCreationTasks(conversations: CreationConversation[], tasks: GenerationTask[]) {
-    if (!tasks.length) return conversations;
-    return conversations.map((conversation) => ({
-        ...conversation,
-        messages: conversation.messages.map((message) => {
-            if (!isCreationInProgress(message)) return message;
-            const taskIDs = new Set(message.taskIds || []);
-            const submissionIDs = new Set(message.submissionIds || []);
-            for (const task of tasks) {
-                if (taskIDs.has(task.id) || submissionIDs.has(task.submissionId || "") || submissionIDs.has(task.clientContext?.submissionId || "") || (task.clientContext?.conversationId === conversation.id && task.clientContext.messageId === message.id)) {
-                    taskIDs.add(task.id);
-                }
-            }
-            const nextTaskIDs = Array.from(taskIDs);
-            return nextTaskIDs.length === (message.taskIds || []).length ? message : { ...message, taskIds: nextTaskIDs };
-        }),
-    }));
-}
-
-function mergeCreationTextStreams(conversations: CreationConversation[], streams: TaskTextStream[]) {
-    if (!streams.length) return conversations;
-    const byTaskID = new Map(streams.map((stream) => [stream.task.id, stream]));
-    return conversations.map((conversation) => ({
-        ...conversation,
-        messages: conversation.messages.map((message) => {
-            if (!isCreationInProgress(message) || message.mode !== "text") return message;
-            let content = message.content;
-            let changed = false;
-            const textCursors = { ...(message.textCursors || {}) };
-            const textAttempts = { ...(message.textAttempts || {}) };
-            for (const taskID of message.taskIds || []) {
-                const stream = byTaskID.get(taskID);
-                if (!stream) continue;
-                const previousAttempt = textAttempts[taskID];
-                if (previousAttempt !== undefined && stream.attempt > previousAttempt) {
-                    content = "";
-                    textCursors[taskID] = 0;
-                    changed = true;
-                }
-                if (previousAttempt !== undefined && stream.attempt < previousAttempt) continue;
-                textAttempts[taskID] = stream.attempt;
-                let cursor = textCursors[taskID] || 0;
-                for (const chunk of stream.chunks) {
-                    if (chunk.sequence <= cursor) continue;
-                    content += chunk.delta;
-                    cursor = chunk.sequence;
-                    changed = true;
-                }
-                if (cursor !== (textCursors[taskID] || 0)) {
-                    textCursors[taskID] = cursor;
-                    changed = true;
-                }
-            }
-            return changed ? { ...message, content, textCursors, textAttempts } : message;
-        }),
+async function enrichCreationTaskSummaries(tasks: GenerationTask[]) {
+    return Promise.all(tasks.map(async (task) => {
+        if (!task.clientContext || (task.status !== "failed" && (task.status !== "succeeded" || task.previewUrl))) return task;
+        const detail = await queryGenerationTask(task.id).catch(() => null);
+        return detail ? { ...task, ...detail, clientContext: task.clientContext } : task;
     }));
 }
 
 type PersistedCreationTask = GenerationTask & { creationResultUrls?: string[]; creationError?: string };
 
 async function persistCreationTaskResults(tasks: GenerationTask[]): Promise<PersistedCreationTask[]> {
+    const addAsset = useAssetStore.getState().addAsset;
     return Promise.all(tasks.map(async (task): Promise<PersistedCreationTask> => {
-        if (task.status !== "succeeded") return task;
+        if (task.status !== "succeeded" || !task.clientContext) return task;
         try {
             const result = task.resultJson ? parseBackendGenerationResult(task) : null;
             const images = result?.images?.length ? result.images : task.previewUrl && task.previewKind !== "video" ? [{ dataUrl: task.previewUrl }] : [];
             if (images.length) {
                 const storedImages = await Promise.all(images.map(async (image, resultIndex) => {
                     const uploaded = await persistCreationImageResult(image);
-                    addCreationAssetOnce(creationImageAsset({
-                        title: task.prompt.slice(0, 24),
-                        uploaded,
-                        metadata: {
-                            source: "create-generation",
-                            taskId: task.id,
-                            conversationId: task.clientContext?.conversationId,
-                            messageId: task.clientContext?.messageId,
-                            batchIndex: task.clientContext?.batchIndex,
-                            resultIndex,
-                            prompt: task.prompt,
-                        },
-                    }), { taskId: task.id, messageId: task.clientContext?.messageId, resultIndex });
+                    addCreationAssetOnce(creationImageAsset({ title: task.prompt.slice(0, 24), uploaded, metadata: { source: "create-generation", taskId: task.id, conversationId: task.clientContext?.conversationId, messageId: task.clientContext?.messageId, batchIndex: task.clientContext?.batchIndex, resultIndex, prompt: task.prompt } }), { taskId: task.id, messageId: task.clientContext?.messageId, resultIndex });
                     return uploaded.url;
                 }));
                 return { ...task, creationResultUrls: storedImages };
@@ -1024,19 +934,7 @@ async function persistCreationTaskResults(tasks: GenerationTask[]): Promise<Pers
             if (videoUrl) {
                 const storedVideo = await storeGeneratedVideo({ url: videoUrl, mimeType: result?.video?.mimeType || "video/mp4" });
                 if (!storedVideo.url) throw new Error("视频结果资源不可用");
-                addCreationAssetOnce(creationVideoAsset({
-                    title: task.prompt.slice(0, 24),
-                    uploaded: storedVideo,
-                    metadata: {
-                        source: "create-generation",
-                        taskId: task.id,
-                        conversationId: task.clientContext?.conversationId,
-                        messageId: task.clientContext?.messageId,
-                        batchIndex: task.clientContext?.batchIndex,
-                        resultIndex: 0,
-                        prompt: task.prompt,
-                    },
-                }), { taskId: task.id, messageId: task.clientContext?.messageId, resultIndex: 0 });
+                addCreationAssetOnce(creationVideoAsset({ title: task.prompt.slice(0, 24), uploaded: storedVideo, metadata: { source: "create-generation", taskId: task.id, conversationId: task.clientContext?.conversationId, messageId: task.clientContext?.messageId, batchIndex: task.clientContext?.batchIndex, resultIndex: 0, prompt: task.prompt } }), { taskId: task.id, messageId: task.clientContext?.messageId, resultIndex: 0 });
                 return { ...task, creationResultUrls: [storedVideo.url] };
             }
             return task;
@@ -1052,65 +950,37 @@ function reconcileCreationTaskMessages(conversations: CreationConversation[], ta
         let conversationChanged = false;
         let completedAt = conversation.updatedAt;
         const messages = conversation.messages.map((message) => {
-            if (!isCreationInProgress(message)) return message;
+            if (message.role !== "assistant" || message.status !== "pending" || message.mode === "text") return message;
             const taskIds = new Set(message.taskIds || []);
-            const submissionIds = new Set(message.submissionIds || []);
             const matches = tasks
-                .filter((task) => taskIds.has(task.id) || submissionIds.has(task.submissionId || "") || submissionIds.has(task.clientContext?.submissionId || "") || (task.clientContext?.conversationId === conversation.id && task.clientContext.messageId === message.id))
+                .filter((task) => taskIds.has(task.id) || (task.clientContext?.conversationId === conversation.id && task.clientContext.messageId === message.id))
                 .sort((left, right) => (left.clientContext?.batchIndex || 0) - (right.clientContext?.batchIndex || 0));
-            const expectedTaskCount = Math.max(message.taskIds?.length || 0, message.submissionIds?.length || 0, ...matches.map((task) => task.clientContext?.batchCount || 0));
-            const nextTaskIds = Array.from(new Set([...(message.taskIds || []), ...matches.map((task) => task.id)]));
-            if (!matches.length || (expectedTaskCount > 0 && matches.length < expectedTaskCount) || matches.some((task) => task.status === "queued" || task.status === "running")) {
-                return nextTaskIds.length === (message.taskIds || []).length ? message : { ...message, taskIds: nextTaskIds };
-            }
+            const expectedTaskCount = Math.max(0, ...matches.map((task) => task.clientContext?.batchCount || 0));
+            if (!matches.length || (expectedTaskCount > 0 && matches.length < expectedTaskCount) || matches.some((task) => task.status === "queued" || task.status === "running")) return message;
 
+            const resultUrls = Array.from(new Set(matches.filter((task) => task.status === "succeeded").flatMap(creationTaskResultUrls)));
+            const failedCount = matches.filter((task) => task.status !== "succeeded" || Boolean(task.creationError)).length;
+            const nextTaskIds = Array.from(new Set([...(message.taskIds || []), ...matches.map((task) => task.id)]));
             completedAt = matches.reduce((latest, task) => conversationTimestamp(task.updatedAt) > conversationTimestamp(latest) ? task.updatedAt : latest, completedAt);
             conversationChanged = true;
             changed = true;
 
-            if (message.mode === "text") {
-                const succeeded = matches.find((task) => task.status === "succeeded");
-                if (succeeded) return { ...message, status: "done" as const, content: creationTaskText(succeeded) || message.content || "文本已生成", error: undefined, taskIds: nextTaskIds };
-                if (matches.every((task) => task.status === "cancelled")) return { ...message, status: "cancelled" as const, content: message.content, error: undefined, taskIds: nextTaskIds };
-                const failed = matches.find((task) => task.status === "failed");
-                return { ...message, status: "error" as const, content: message.content, error: generationErrorMessage(failed?.error || "任务已结束，但文本结果暂时无法读取"), taskIds: nextTaskIds };
-            }
-
-            const resultUrls = Array.from(new Set(matches.filter((task) => task.status === "succeeded").flatMap(creationTaskResultUrls)));
-            const failedCount = matches.filter((task) => task.status !== "succeeded" || Boolean(task.creationError)).length;
             if (resultUrls.length) {
                 const content = message.mode === "video" ? "视频已生成" : failedCount ? `${resultUrls.length} 张图片已生成，${failedCount} 张失败` : "图片已生成";
                 return { ...message, status: "done" as const, content, resultUrls, error: undefined, taskIds: nextTaskIds };
             }
-            if (matches.every((task) => task.status === "cancelled")) return { ...message, status: "cancelled" as const, content: message.content, error: undefined, taskIds: nextTaskIds };
+            if (matches.every((task) => task.status === "cancelled")) return { ...message, status: "cancelled" as const, content: "已停止", error: undefined, taskIds: nextTaskIds };
             const failed = matches.find((task) => task.status === "failed" || task.creationError);
-            return { ...message, status: "error" as const, content: message.content || "生成失败", error: generationErrorMessage(failed?.creationError || failed?.error || "任务已结束，但生成结果暂时无法读取"), taskIds: nextTaskIds };
+            return { ...message, status: "error" as const, content: "生成失败", error: generationErrorMessage(failed?.creationError || failed?.error || "任务已结束，但生成结果暂时无法读取"), taskIds: nextTaskIds };
         });
         return conversationChanged ? { ...conversation, messages, updatedAt: completedAt } : conversation;
     });
     return changed ? next : conversations;
 }
 
-function creationTaskText(task: GenerationTask) {
-    if (!task.resultJson) return "";
-    try {
-        return parseBackendGenerationResult(task).text || "";
-    } catch {
-        return "";
-    }
-}
-
-function creationTextTaskPrompt(history: CreationMessage[], current: CreationMessage) {
-    const turns = [...history, current].filter((message) => message.role === "user" || message.role === "assistant").slice(-12);
-    if (turns.length <= 1) return expandCreationPrompt(current.content, current.references || [], current.attachments || []);
-    return [
-        "请基于以下创作对话继续完成当前用户请求。",
-        ...turns.map((message) => `${message.role === "assistant" ? "助手" : "用户"}：${message.role === "user" ? expandCreationPrompt(message.content, message.references || [], message.attachments || []) : message.content}`),
-    ].join("\n\n");
-}
-
 function creationTaskResultUrls(task: PersistedCreationTask) {
-    return task.creationResultUrls || [];
+    if (task.creationResultUrls?.length) return task.creationResultUrls;
+    return [];
 }
 
 function conversationTimestamp(value: string) {

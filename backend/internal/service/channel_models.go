@@ -52,26 +52,6 @@ func (s *Service) EnsureSystemChannelModels() error {
 			if err := s.syncInitialChannelModels(&channels[index], channelModelNames(channels[index])); err != nil {
 				return err
 			}
-			items, err = s.repo.ChannelModels(channels[index].ID, true)
-			if err != nil {
-				return err
-			}
-		}
-		for itemIndex := range items {
-			item := &items[itemIndex]
-			if item.Capability != "video" || item.Protocol == "" || strings.TrimSpace(item.CapabilityConfigJSON) != "" {
-				continue
-			}
-			capabilityConfig := DefaultModelCapabilityConfig(string(item.Protocol))
-			encoded, err := json.Marshal(capabilityConfig)
-			if err != nil {
-				return err
-			}
-			item.CapabilityConfigJSON = string(encoded)
-			item.CapabilityVersion++
-			if err := s.repo.SaveChannelModel(item); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
@@ -108,7 +88,7 @@ func (s *Service) FetchAdminChannelModels(ctx context.Context, actor *model.User
 	if err := s.RequireAdmin(actor); err != nil {
 		return nil, err
 	}
-	channel, err := s.adminSystemChannel(channelID)
+	channel, err := s.repo.AdminSystemChannel(channelID)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +137,7 @@ func (s *Service) SaveAdminChannelModel(actor *model.User, channelID string, id 
 	if err != nil {
 		return nil, err
 	}
-	if capability == "video" {
+	if capability == "image" || capability == "video" {
 		if _, err := NormalizeModelCapabilityConfig(capability, string(protocol), req.CapabilityConfig); err != nil {
 			return nil, err
 		}
@@ -213,7 +193,7 @@ func (s *Service) SaveAdminChannelModel(actor *model.User, channelID string, id 
 	item.OutputTokenPriceMicrocredits = req.OutputTokenPriceMicrocredits
 	item.CachedTokenPriceMicrocredits = req.CachedTokenPriceMicrocredits
 	item.PriceConfigured = req.PriceConfigured
-	if capability == "video" {
+	if capability == "image" || capability == "video" {
 		capabilityConfig, normalizeErr := NormalizeModelCapabilityConfig(capability, string(protocol), req.CapabilityConfig)
 		if normalizeErr != nil {
 			return nil, normalizeErr
@@ -246,7 +226,7 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 	if err := s.RequireAdmin(actor); err != nil {
 		return nil, err
 	}
-	channel, err := s.adminSystemChannel(channelID)
+	channel, err := s.repo.AdminSystemChannel(channelID)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +234,7 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 	if err != nil {
 		return nil, err
 	}
-	if capability == "video" {
+	if capability == "image" || capability == "video" {
 		if _, err := NormalizeModelCapabilityConfig(capability, string(protocol), req.CapabilityConfig); err != nil {
 			return nil, err
 		}
@@ -275,13 +255,9 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 	}[capability]
 	videoSeconds := "6"
 	videoSecondsValue := 6
-	audioVoice := "alloy"
 	if protocol == model.ChannelInterfaceVolcengineJiMengVideo {
 		videoSeconds = "5"
 		videoSecondsValue = 5
-	}
-	if protocol == model.ChannelInterfaceVolcenginePlanTTS {
-		audioVoice = volcenginePlanTTSDefaultSpeaker
 	}
 	input := canvasGenerationInput{
 		Mode:   capability,
@@ -302,11 +278,18 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 			VQuality:           "720",
 			VideoGenerateAudio: "false",
 			VideoWatermark:     "false",
-			AudioVoice:         audioVoice,
+			AudioVoice:         "alloy",
 			AudioFormat:        "mp3",
 			AudioSpeed:         "1",
 		},
 		Metadata: map[string]interface{}{},
+	}
+	if capability == "image" {
+		profile, normalizeErr := NormalizeModelCapabilityConfig(capability, string(protocol), req.CapabilityConfig)
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
+		input.ImageCapability = profile.Image
 	}
 
 	// 测试复用真实生成协议、运行时并发和熔断策略，但不创建用户任务或计费订单。
@@ -471,9 +454,9 @@ func (s *Service) syncChannelModelNames(channel *model.ModelChannel) error {
 
 func capabilityForProtocol(protocol model.ChannelInterfaceType) string {
 	switch protocol {
-	case model.ChannelInterfaceOpenAIImage, model.ChannelInterfaceXAIImage, model.ChannelInterfaceVolcengineArkImage, model.ChannelInterfaceVolcengineJiMengImage:
+	case model.ChannelInterfaceOpenAIImage, model.ChannelInterfaceGrokImage, model.ChannelInterfaceVolcengineArkImage, model.ChannelInterfaceVolcengineJiMengImage:
 		return "image"
-	case model.ChannelInterfaceOpenAIAudio, model.ChannelInterfaceAsyncAudio, model.ChannelInterfaceVolcenginePlanTTS:
+	case model.ChannelInterfaceOpenAIAudio, model.ChannelInterfaceAsyncAudio:
 		return "audio"
 	case model.ChannelInterfaceNewAPIVideo, model.ChannelInterfaceNewAPIChannel1, model.ChannelInterfaceNewAPIChannel2, model.ChannelInterfaceXAIVideo, model.ChannelInterfaceVolcengineArkVideo, model.ChannelInterfaceVolcengineJiMengVideo, model.ChannelInterfaceGeminiVeo:
 		return "video"

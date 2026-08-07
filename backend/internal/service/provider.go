@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"infinite-canvas/backend/internal/model"
+
+	"gorm.io/gorm"
 )
 
 type canvasGenerationInput struct {
@@ -32,6 +34,8 @@ type canvasGenerationInput struct {
 	ReferenceAudios []providerMedia        `json:"referenceAudios"`
 	Mask            *providerMedia         `json:"mask"`
 	Metadata        map[string]interface{} `json:"metadata"`
+	ImageCapability *ImageCapabilityConfig `json:"-"`
+	StreamText      bool                   `json:"-"` // 分镜请求使用上游 SSE 保活；最终结构仍在流结束后统一校验。
 	VideoCapability *VideoCapabilityConfig `json:"-"`
 }
 
@@ -63,7 +67,6 @@ type providerConfig struct {
 const providerHTTPTimeout = 5 * time.Minute
 const videoPollTimeout = 30 * time.Minute
 const maxProviderResponseBytes int64 = 64 << 20
-const maxTextStreamResponseBytes int64 = 8 << 20
 
 type providerMedia struct {
 	ID         string `json:"id"`
@@ -151,7 +154,7 @@ func (e providerHTTPError) Error() string {
 	return fmt.Sprintf("接口请求失败：%s %s", e.Status, e.Body)
 }
 
-func (s *Service) processCanvasGenerationTask(ctx context.Context, userID string, taskType string, fallbackPrompt string, rawInput string) (map[string]interface{}, error) {
+func (s *Service) processCanvasGenerationTask(ctx context.Context, userID string, taskProjectID string, taskType string, fallbackPrompt string, rawInput string) (map[string]interface{}, error) {
 	var input canvasGenerationInput
 	if err := json.Unmarshal([]byte(rawInput), &input); err != nil {
 		return nil, fmt.Errorf("任务输入解析失败：%w", err)
@@ -179,6 +182,11 @@ func (s *Service) processCanvasGenerationTask(ctx context.Context, userID string
 		return nil, err
 	}
 	input.Config = config
+	if (input.Mode == "image" || input.Mode == "video") && input.Metadata != nil {
+		if err := s.applyGenerationStyleProfile(userID, taskProjectID, &input); err != nil {
+			return nil, err
+		}
+	}
 	if input.Config.APIFormat == "gemini" && input.Config.InterfaceType != string(model.ChannelInterfaceGeminiVeo) {
 		return nil, errors.New("后端任务队列暂不支持 Gemini 调用格式，请使用 OpenAI 兼容渠道")
 	}
@@ -190,6 +198,11 @@ func (s *Service) processCanvasGenerationTask(ctx context.Context, userID string
 	}
 	if isVolcengineJiMengProtocol(input.Config.InterfaceType) && strings.TrimSpace(input.Config.SecretKey) == "" {
 		return nil, errors.New("即梦官方 API 缺少 Secret Key")
+	}
+	if input.Mode == "image" {
+		if err := s.validateResolvedImageCapability(&input); err != nil {
+			return nil, err
+		}
 	}
 	if input.Mode == "video" {
 		if err := s.validateResolvedVideoCapability(&input); err != nil {
@@ -225,6 +238,8 @@ func (s *Service) processCanvasGenerationTask(ctx context.Context, userID string
 	}
 }
 
+// processCanvasTextGenerationTask keeps task-owned text chunks durable so a page reload can recover the draft.
+// The provider's stream parsing remains centralized in runTextTask to preserve its protocol-specific behavior.
 func (s *Service) processCanvasTextGenerationTask(ctx context.Context, task model.Task) (map[string]interface{}, error) {
 	var input canvasGenerationInput
 	if err := json.Unmarshal([]byte(task.InputJSON), &input); err != nil {
@@ -260,39 +275,24 @@ func (s *Service) processCanvasTextGenerationTask(ctx context.Context, task mode
 			return nil, err
 		}
 	}
+	input.StreamText = true
+	result, err := runTextTask(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	text, _ := result["text"].(string)
+	if text == "" {
+		return nil, errors.New("文本接口没有返回内容")
+	}
 	writer, err := s.newTaskTextWriter(task)
 	if err != nil {
 		return nil, err
 	}
-	flushStop := make(chan struct{})
-	flushDone := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(taskTextChunkFlushInterval)
-		defer ticker.Stop()
-		defer close(flushDone)
-		for {
-			select {
-			case <-ticker.C:
-				if writer.Flush() != nil {
-					return
-				}
-			case <-flushStop:
-				return
-			}
-		}
-	}()
-	result, runErr := runTextTaskStream(ctx, input, writer.Write)
-	close(flushStop)
-	<-flushDone
-	flushErr := writer.Flush()
-	if runErr != nil {
-		return nil, runErr
+	if err := writer.Write(text); err != nil {
+		return nil, err
 	}
-	if writerErr := writer.Failure(); writerErr != nil {
-		return nil, writerErr
-	}
-	if flushErr != nil {
-		return nil, flushErr
+	if err := writer.Flush(); err != nil {
+		return nil, err
 	}
 	if operation != "" {
 		if err := validatePromptTemplateResult(operation, result); err != nil {
@@ -300,6 +300,180 @@ func (s *Service) processCanvasTextGenerationTask(ctx context.Context, task mode
 		}
 	}
 	return result, nil
+}
+
+type styleExecutionPlanDocument struct {
+	SchemaVersion   int    `json:"schemaVersion"`
+	ProfilePresetID string `json:"profilePresetId"`
+	ProfileRevision int    `json:"profileRevision"`
+	Mode            string `json:"mode"`
+	Model           string `json:"model"`
+	InterfaceType   string `json:"interfaceType"`
+	Status          string `json:"status"`
+	Prompt          string `json:"prompt"`
+}
+
+func (s *Service) applyGenerationStyleProfile(userID string, taskProjectID string, input *canvasGenerationInput) error {
+	styleProfileJSON := metadataString(input.Metadata, "styleProfileJson")
+	if strings.TrimSpace(styleProfileJSON) == "" {
+		return nil
+	}
+	if _, err := validateStyleProfileJSON(styleProfileJSON); err != nil {
+		return fmt.Errorf("项目画风执行配置无效：%w", err)
+	}
+	var profile styleProfileDocument
+	if err := json.Unmarshal([]byte(styleProfileJSON), &profile); err != nil {
+		return fmt.Errorf("项目画风执行配置解析失败：%w", err)
+	}
+	storedProfileJSON, storedPresetID, belongsToProject, err := s.taskProjectStyleProfile(userID, taskProjectID)
+	if err != nil {
+		return fmt.Errorf("读取项目画风失败：%w", err)
+	}
+	if belongsToProject {
+		if strings.TrimSpace(storedProfileJSON) == "" {
+			// 旧项目只有 preset ID，允许画布把该预设编译为结构化快照；仍需锁定同一预设，不能借降级路径换画风。
+			if strings.TrimSpace(storedPresetID) == "" || strings.TrimSpace(profile.PresetID) != strings.TrimSpace(storedPresetID) {
+				return errors.New("任务画风预设与项目当前设置不一致，请刷新画布后重试")
+			}
+		} else {
+			matches, compareErr := equivalentStyleProfileJSON(styleProfileJSON, storedProfileJSON)
+			if compareErr != nil || !matches {
+				return errors.New("任务画风快照与项目当前设置不一致，请刷新画布后重试")
+			}
+		}
+	}
+	plan, err := decodeStyleExecutionPlan(input.Metadata["styleExecutionPlan"])
+	if err != nil {
+		return err
+	}
+	stylePrompt, expectedStatus, warnings := resolveGenerationStyleExecution(profile, input.Config.Model, firstNonEmpty(input.Config.InterfaceType, input.Config.APIFormat))
+	if plan.SchemaVersion != 1 || plan.ProfilePresetID != profile.PresetID || plan.ProfileRevision != profile.Revision || plan.Mode != input.Mode || !strings.EqualFold(plan.Model, input.Config.Model) || plan.InterfaceType != firstNonEmpty(input.Config.InterfaceType, input.Config.APIFormat) {
+		return errors.New("项目画风执行计划与当前模型或快照不一致，请刷新配置后重试")
+	}
+	if plan.Status != expectedStatus || strings.TrimSpace(plan.Prompt) != stylePrompt {
+		return errors.New("项目画风执行计划已失效，请重新生成执行计划")
+	}
+	if expectedStatus == "blocked" {
+		return fmt.Errorf("项目画风与当前生成模型不兼容：%s", strings.Join(warnings, "；"))
+	}
+	if stylePrompt != "" && !strings.Contains(input.Prompt, stylePrompt) {
+		input.Prompt = strings.TrimSpace(input.Prompt) + "\n\n【项目画风执行规范】\n" + stylePrompt
+	}
+	return nil
+}
+
+func (s *Service) taskProjectStyleProfile(userID string, canvasOrProjectID string) (string, string, bool, error) {
+	id := strings.TrimSpace(canvasOrProjectID)
+	if id == "" {
+		return "", "", false, nil
+	}
+	if canvas, err := s.repo.CanvasProjectForUser(userID, id); err == nil {
+		if strings.TrimSpace(canvas.ProjectID) == "" {
+			return "", "", false, nil
+		}
+		project, projectErr := s.repo.ProjectForUser(userID, canvas.ProjectID)
+		if projectErr != nil {
+			return "", "", true, projectErr
+		}
+		return project.StyleProfileJSON, project.StylePresetID, true, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", "", false, err
+	}
+	project, err := s.repo.ProjectForUser(userID, id)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	return project.StyleProfileJSON, project.StylePresetID, true, nil
+}
+
+func equivalentStyleProfileJSON(left string, right string) (bool, error) {
+	var leftValue interface{}
+	if err := json.Unmarshal([]byte(left), &leftValue); err != nil {
+		return false, err
+	}
+	var rightValue interface{}
+	if err := json.Unmarshal([]byte(right), &rightValue); err != nil {
+		return false, err
+	}
+	leftCanonical, err := json.Marshal(leftValue)
+	if err != nil {
+		return false, err
+	}
+	rightCanonical, err := json.Marshal(rightValue)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(leftCanonical, rightCanonical), nil
+}
+
+func decodeStyleExecutionPlan(value interface{}) (styleExecutionPlanDocument, error) {
+	if value == nil {
+		return styleExecutionPlanDocument{}, errors.New("项目画风执行计划缺失")
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return styleExecutionPlanDocument{}, errors.New("项目画风执行计划格式无效")
+	}
+	var plan styleExecutionPlanDocument
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		return styleExecutionPlanDocument{}, errors.New("项目画风执行计划格式无效")
+	}
+	return plan, nil
+}
+
+func resolveGenerationStyleExecution(profile styleProfileDocument, generationModel string, interfaceType string) (string, string, []string) {
+	fragments := []string{strings.TrimSpace(profile.Prompt)}
+	if negative := strings.TrimSpace(profile.NegativePrompt); negative != "" {
+		fragments = append(fragments, "【全局负面 Prompt】\n"+negative)
+	}
+	warnings := make([]string, 0)
+	for _, asset := range profile.Assets {
+		if asset.Enabled != nil && !*asset.Enabled {
+			continue
+		}
+		if asset.Status != "validated" {
+			reason := "资产尚未验证"
+			if asset.Status == "unavailable" {
+				reason = "资产当前不可用"
+			}
+			warnings = append(warnings, asset.Title+"："+reason)
+			continue
+		}
+		if len(asset.BaseModels) > 0 && !styleAssetSupportsModel(asset.BaseModels, generationModel) {
+			warnings = append(warnings, asset.Title+"：仅兼容 "+strings.Join(asset.BaseModels, "、"))
+			continue
+		}
+		switch asset.Kind {
+		case "prompt", "template":
+			fragments = append(fragments, strings.TrimSpace(asset.PromptFragment))
+			fragments = append(fragments, nonEmptyStyleProfileStrings(asset.TriggerWords)...)
+		case "reference":
+			warnings = append(warnings, asset.Title+"：项目参考图自动注入适配器尚未启用")
+		case "lora":
+			warnings = append(warnings, asset.Title+"：当前 "+firstNonEmpty(interfaceType, "图片")+" 协议未启用 LoRA 适配器")
+		}
+	}
+	normalizedFragments := nonEmptyStyleProfileStrings(fragments)
+	status := "ready"
+	if len(warnings) > 0 {
+		status = "degraded"
+		if profile.ExecutionPolicy == "strict-assets" {
+			status = "blocked"
+		}
+	}
+	return strings.Join(normalizedFragments, "\n"), status, warnings
+}
+
+func styleAssetSupportsModel(baseModels []string, generationModel string) bool {
+	for _, baseModel := range baseModels {
+		if strings.EqualFold(strings.TrimSpace(baseModel), strings.TrimSpace(generationModel)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) validateResolvedVideoCapability(input *canvasGenerationInput) error {
@@ -321,6 +495,33 @@ func (s *Service) validateResolvedVideoCapability(input *canvasGenerationInput) 
 	}
 	input.VideoCapability = profile.Video
 	return validateVideoTask(profile.Video, *input)
+}
+
+func (s *Service) validateResolvedImageCapability(input *canvasGenerationInput) error {
+	fallback := DefaultImageCapabilityConfig(input.Config.InterfaceType, input.Config.Model)
+	channelID := strings.TrimSpace(input.Config.ChannelID)
+	if channelID == "" {
+		if input.Config.CapabilityConfig != nil && input.Config.CapabilityConfig.Image != nil {
+			input.ImageCapability = input.Config.CapabilityConfig.Image
+		} else {
+			input.ImageCapability = fallback
+		}
+		return validateImageTask(input.ImageCapability, *input)
+	}
+	item, err := s.repo.ChannelModelByKey(channelID, strings.TrimPrefix(strings.TrimSpace(input.Config.Model), "models/"))
+	if err != nil {
+		return errors.New("当前系统渠道模型未配置或已停用")
+	}
+	profile, err := DecodeModelCapabilityConfig(item.CapabilityConfigJSON)
+	if err != nil {
+		return errors.New("当前图片模型能力参数无效")
+	}
+	if profile != nil && profile.Image != nil {
+		input.ImageCapability = profile.Image
+	} else {
+		input.ImageCapability = fallback
+	}
+	return validateImageTask(input.ImageCapability, *input)
 }
 
 func metadataStringValues(value any) map[string]string {
@@ -434,7 +635,7 @@ func (s *Service) resolveProviderConfig(config providerConfig) (providerConfig, 
 		}
 		return config, nil
 	}
-	channel, err := s.SystemChannel(channelID)
+	channel, err := s.repo.SystemChannel(channelID)
 	if err != nil {
 		return providerConfig{}, errors.New("系统渠道不存在或已停用")
 	}
@@ -500,14 +701,14 @@ func systemChannelIDFromBaseURL(baseURL string) string {
 }
 
 func runImageTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
+	if input.Config.InterfaceType == string(model.ChannelInterfaceGrokImage) {
+		return runGrokImageTask(ctx, input)
+	}
 	if input.Config.InterfaceType == string(model.ChannelInterfaceVolcengineJiMengImage) {
 		return runVolcengineJiMengImageTask(ctx, input)
 	}
 	if input.Config.InterfaceType == string(model.ChannelInterfaceVolcengineArkImage) {
 		return runVolcengineArkImageTask(ctx, input)
-	}
-	if input.Config.InterfaceType == string(model.ChannelInterfaceXAIImage) {
-		return runXAIImageTask(ctx, input)
 	}
 	var payload imageResponse
 	if input.Mask != nil {
@@ -525,16 +726,20 @@ func runImageTask(ctx context.Context, input canvasGenerationInput) (map[string]
 		writeField(writer, "model", input.Config.Model)
 		writeField(writer, "prompt", withSystemPrompt(input.Config, input.Prompt))
 		writeField(writer, "n", "1")
-		writeField(writer, "response_format", "b64_json")
-		writeField(writer, "output_format", "png")
-		if input.Config.TransparentBackground == "true" {
+		if imageParameterSupported(input.ImageCapability, "response_format") {
+			writeField(writer, "response_format", "b64_json")
+		}
+		if imageParameterSupported(input.ImageCapability, "output_format") {
+			writeField(writer, "output_format", "png")
+		}
+		if imageTransparentBackgroundSupported(input.ImageCapability) && input.Config.TransparentBackground == "true" {
 			writeField(writer, "background", "transparent")
 		}
-		if input.Config.Quality != "" {
+		if imageQualitySupported(input.ImageCapability) && input.Config.Quality != "" {
 			writeField(writer, "quality", normalizeImageQuality(input.Config.Quality))
 		}
-		if size := normalizePixelSize(input.Config.Size); size != "" {
-			writeField(writer, "size", size)
+		if key, value := imageSizeParameter(input.ImageCapability, input.Config.Size); value != "" {
+			writeField(writer, key, value)
 		}
 		for _, image := range input.ReferenceImages {
 			if err := writeMediaPart(writer, "image", image); err != nil {
@@ -554,20 +759,24 @@ func runImageTask(ctx context.Context, input canvasGenerationInput) (map[string]
 		}
 	} else {
 		body := map[string]interface{}{
-			"model":           input.Config.Model,
-			"prompt":          withSystemPrompt(input.Config, input.Prompt),
-			"n":               1,
-			"response_format": "b64_json",
-			"output_format":   "png",
+			"model":  input.Config.Model,
+			"prompt": withSystemPrompt(input.Config, input.Prompt),
+			"n":      1,
 		}
-		if input.Config.TransparentBackground == "true" {
+		if imageParameterSupported(input.ImageCapability, "response_format") {
+			body["response_format"] = "b64_json"
+		}
+		if imageParameterSupported(input.ImageCapability, "output_format") {
+			body["output_format"] = "png"
+		}
+		if imageTransparentBackgroundSupported(input.ImageCapability) && input.Config.TransparentBackground == "true" {
 			body["background"] = "transparent"
 		}
-		if input.Config.Quality != "" {
+		if imageQualitySupported(input.ImageCapability) && input.Config.Quality != "" {
 			body["quality"] = normalizeImageQuality(input.Config.Quality)
 		}
-		if size := normalizePixelSize(input.Config.Size); size != "" {
-			body["size"] = size
+		if key, value := imageSizeParameter(input.ImageCapability, input.Config.Size); value != "" {
+			body[key] = value
 		}
 		if err := postJSON(ctx, input.Config, "/images/generations", body, &payload); err != nil {
 			return nil, err
@@ -580,12 +789,13 @@ func runImageTask(ctx context.Context, input canvasGenerationInput) (map[string]
 	return map[string]interface{}{"mode": "image", "images": images}, nil
 }
 
-func runXAIImageTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
-	if len(input.ReferenceImages) > 0 || input.Mask != nil {
-		return nil, errors.New("xAI 图片协议当前仅启用文生图，不支持参考图或蒙版编辑")
+func runGrokImageTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
+	body, path, err := grokImageRequestBody(input)
+	if err != nil {
+		return nil, err
 	}
 	var payload imageResponse
-	if err := postJSON(ctx, input.Config, "/images/generations", xaiImageBody(input), &payload); err != nil {
+	if err := postJSON(ctx, input.Config, path, body, &payload); err != nil {
 		return nil, err
 	}
 	images, err := imageDataURLs(payload)
@@ -595,62 +805,33 @@ func runXAIImageTask(ctx context.Context, input canvasGenerationInput) (map[stri
 	return map[string]interface{}{"mode": "image", "images": images}, nil
 }
 
-func xaiImageBody(input canvasGenerationInput) map[string]interface{} {
-	body := map[string]interface{}{
-		"model":           input.Config.Model,
-		"prompt":          withSystemPrompt(input.Config, input.Prompt),
-		"n":               1,
-		"response_format": "b64_json",
-		"output_format":   "png",
+func grokImageRequestBody(input canvasGenerationInput) (grokImageRequest, string, error) {
+	if input.Mask != nil {
+		return grokImageRequest{}, "", errors.New("Grok 图片协议不支持蒙版编辑，请移除蒙版后重试")
 	}
-	if ratio := normalizeXAIImageAspectRatio(input.Config.Size); ratio != "" {
-		body["aspect_ratio"] = ratio
+	body := grokImageRequest{Model: input.Config.Model, Prompt: withSystemPrompt(input.Config, input.Prompt), N: 1, ResponseFormat: "url"}
+	if len(input.ReferenceImages) == 0 {
+		return body, "/images/generations", nil
 	}
-	return body
+	if len(input.ReferenceImages) != 1 {
+		return grokImageRequest{}, "", fmt.Errorf("Grok 图片编辑只支持 1 张参考图，当前连接了 %d 张", len(input.ReferenceImages))
+	}
+	imageURL, err := grokImageInputURL(input.ReferenceImages[0])
+	if err != nil {
+		return grokImageRequest{}, "", err
+	}
+	body.Image = &grokImageInput{URL: imageURL}
+	return body, "/images/edits", nil
 }
 
-func normalizeXAIImageAspectRatio(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" || value == "auto" {
-		return ""
+func grokImageInputURL(media providerMedia) (string, error) {
+	if isPublicMediaURL(strings.TrimSpace(media.URL)) {
+		return strings.TrimSpace(media.URL), nil
 	}
-	if strings.Contains(value, ":") {
-		return value
-	}
-	parts := strings.Split(value, "x")
-	if len(parts) != 2 {
-		return ""
-	}
-	width, widthErr := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-	height, heightErr := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 {
-		return ""
-	}
-	ratio := width / height
-	candidates := []struct {
-		value string
-		ratio float64
-	}{
-		{"1:1", 1}, {"16:9", 16.0 / 9}, {"9:16", 9.0 / 16},
-		{"4:3", 4.0 / 3}, {"3:4", 3.0 / 4}, {"3:2", 3.0 / 2}, {"2:3", 2.0 / 3},
-	}
-	best := candidates[0]
-	bestDiff := math.Abs(ratio - best.ratio)
-	for _, candidate := range candidates[1:] {
-		if diff := math.Abs(ratio - candidate.ratio); diff < bestDiff {
-			best, bestDiff = candidate, diff
-		}
-	}
-	return best.value
+	return openAIImageInputURL(media)
 }
 
-const (
-	// Ark rejects image requests below 3,686,400 pixels. The generation UI
-	// commonly starts from aspect-ratio presets around 1024px, so normalize at
-	// the provider boundary instead of exposing a provider-specific constraint.
-	volcengineArkImageMinPixels = 3686400
-	volcengineArkImageMaxPixels = 4624220
-)
+const volcengineArkImageMaxPixels = 4624220
 
 func runVolcengineArkImageTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
 	if input.Mask != nil {
@@ -677,8 +858,11 @@ func volcengineArkImageBody(input canvasGenerationInput) (map[string]interface{}
 		"prompt": withSystemPrompt(input.Config, input.Prompt),
 		"n":      1,
 	}
-	if size := normalizeVolcengineArkImageSize(input.Config.Size); size != "" {
-		body["size"] = size
+	if key, value := imageSizeParameter(input.ImageCapability, input.Config.Size); value != "" {
+		if key == "size" {
+			value = normalizeVolcengineArkImageSize(value)
+		}
+		body[key] = value
 	}
 	if len(input.ReferenceImages) == 0 {
 		return body, nil
@@ -710,17 +894,10 @@ func normalizeVolcengineArkImageSize(value string) string {
 	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 {
 		return size
 	}
-	pixels := int64(width) * int64(height)
-	if pixels < volcengineArkImageMinPixels {
-		scale := math.Sqrt(float64(volcengineArkImageMinPixels) / float64(pixels))
-		width = int(math.Ceil(float64(width)*scale/2)) * 2
-		height = int(math.Ceil(float64(height)*scale/2)) * 2
-		pixels = int64(width) * int64(height)
+	if int64(width)*int64(height) <= volcengineArkImageMaxPixels {
+		return size
 	}
-	if pixels <= volcengineArkImageMaxPixels {
-		return strconv.Itoa(width) + "x" + strconv.Itoa(height)
-	}
-	scale := math.Sqrt(float64(volcengineArkImageMaxPixels) / float64(pixels))
+	scale := math.Sqrt(float64(volcengineArkImageMaxPixels) / (float64(width) * float64(height)))
 	width = int(math.Floor(float64(width)*scale/2)) * 2
 	height = int(math.Floor(float64(height)*scale/2)) * 2
 	for width > 2 && height > 2 && int64(width)*int64(height) > volcengineArkImageMaxPixels {
@@ -743,176 +920,14 @@ func runTextTask(ctx context.Context, input canvasGenerationInput) (map[string]i
 	return runLegacyTextTask(ctx, input)
 }
 
-type textDeltaHandler func(string) error
-
-func runTextTaskStream(ctx context.Context, input canvasGenerationInput, onDelta textDeltaHandler) (map[string]interface{}, error) {
-	if onDelta == nil {
-		return runTextTask(ctx, input)
-	}
-	switch input.Config.InterfaceType {
-	case "chat-completion":
-		return runChatCompletionsTextTaskStream(ctx, input, onDelta)
-	case "openai-response":
-		return runResponsesTextTaskStream(ctx, input, onDelta)
-	default:
-		result, err := runTextTask(ctx, input)
-		if err != nil {
-			return nil, err
-		}
-		if text, _ := result["text"].(string); text != "" {
-			if err := onDelta(text); err != nil {
-				return nil, err
-			}
-		}
-		return result, nil
-	}
-}
-
-func runResponsesTextTaskStream(ctx context.Context, input canvasGenerationInput, onDelta textDeltaHandler) (map[string]interface{}, error) {
-	responseInput, err := textResponseInput(input)
-	if err != nil {
-		return nil, err
-	}
-	return streamTextTaskRequest(ctx, input.Config, "/responses", map[string]interface{}{"model": input.Config.Model, "input": responseInput}, extractResponseText, extractResponsesStreamDelta, onDelta)
-}
-
-func runChatCompletionsTextTaskStream(ctx context.Context, input canvasGenerationInput, onDelta textDeltaHandler) (map[string]interface{}, error) {
-	messages := []map[string]interface{}{}
-	if systemPrompt := strings.TrimSpace(input.Config.SystemPrompt); systemPrompt != "" {
-		messages = append(messages, map[string]interface{}{"role": "system", "content": systemPrompt})
-	}
-	userContent, err := textChatContent(input)
-	if err != nil {
-		return nil, err
-	}
-	messages = append(messages, map[string]interface{}{"role": "user", "content": userContent})
-	return streamTextTaskRequest(ctx, input.Config, "/chat/completions", map[string]interface{}{"model": input.Config.Model, "messages": messages}, extractChatCompletionText, extractChatCompletionStreamDelta, onDelta)
-}
-
-func streamTextTaskRequest(ctx context.Context, config providerConfig, path string, body map[string]interface{}, extractText func(map[string]interface{}) string, extractDelta func(string, map[string]interface{}) string, onDelta textDeltaHandler) (map[string]interface{}, error) {
-	body["stream"] = true
-	var text strings.Builder
-	appendDelta := func(delta string) error {
-		if delta == "" {
-			return nil
-		}
-		if err := onDelta(delta); err != nil {
-			return err
-		}
-		text.WriteString(delta)
-		return nil
-	}
-	handleEvent := func(event string, data string) error {
-		if strings.TrimSpace(data) == "[DONE]" {
-			return nil
-		}
-		var payload map[string]interface{}
-		if err := json.Unmarshal([]byte(data), &payload); err != nil {
-			return fmt.Errorf("文本流事件格式无效：%w", err)
-		}
-		if message := providerStreamError(payload); message != "" {
-			return errors.New(message)
-		}
-		return appendDelta(extractDelta(event, payload))
-	}
-	handleJSON := func(data []byte) error {
-		var payload map[string]interface{}
-		if err := json.Unmarshal(data, &payload); err != nil {
-			return fmt.Errorf("文本接口返回非 JSON 内容：%w", err)
-		}
-		if message := providerStreamError(payload); message != "" {
-			return errors.New(message)
-		}
-		if content := extractText(payload); content != "" {
-			return appendDelta(content)
-		}
-		return errors.New("文本接口没有返回内容")
-	}
-	if _, err := postTextEventStream(ctx, config, path, body, handleEvent, handleJSON); err != nil {
-		return nil, err
-	}
-	if text.Len() == 0 {
-		return nil, errors.New("文本接口没有返回内容")
-	}
-	return map[string]interface{}{"mode": "text", "text": text.String()}, nil
-}
-
-func providerStreamError(payload map[string]interface{}) string {
-	if errorValue, ok := payload["error"].(map[string]interface{}); ok {
-		if message := stringField(errorValue, "message"); message != "" {
-			return message
-		}
-	}
-	if message := stringField(payload, "message"); message != "" && (strings.Contains(strings.ToLower(stringField(payload, "type")), "error") || payload["code"] != nil) {
-		return message
-	}
-	if code, ok := payload["code"].(float64); ok && code != 0 {
-		return defaultString(stringField(payload, "msg"), "请求失败")
-	}
-	return ""
-}
-
-func extractResponsesStreamDelta(event string, payload map[string]interface{}) string {
-	eventType := strings.ToLower(strings.TrimSpace(defaultString(event, stringField(payload, "type"))))
-	if strings.Contains(eventType, "output_text.delta") || strings.Contains(eventType, "text.delta") || eventType == "" {
-		return stringField(payload, "delta")
-	}
-	return ""
-}
-
-func extractChatCompletionStreamDelta(_ string, payload map[string]interface{}) string {
-	if data, ok := payload["data"].(map[string]interface{}); ok {
-		payload = data
-	}
-	choices, ok := payload["choices"].([]interface{})
-	if !ok {
-		return ""
-	}
-	var chunks []string
-	for _, choice := range choices {
-		record, ok := choice.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if delta, ok := record["delta"].(map[string]interface{}); ok {
-			if text := streamContentText(delta["content"]); text != "" {
-				chunks = append(chunks, text)
-			}
-		}
-		if text := stringField(record, "text"); text != "" {
-			chunks = append(chunks, text)
-		}
-	}
-	return strings.Join(chunks, "")
-}
-
-func streamContentText(value interface{}) string {
-	switch item := value.(type) {
-	case string:
-		return item
-	case []interface{}:
-		var chunks []string
-		for _, child := range item {
-			if record, ok := child.(map[string]interface{}); ok {
-				if text := stringField(record, "text"); text != "" {
-					chunks = append(chunks, text)
-				}
-			}
-		}
-		return strings.Join(chunks, "")
-	default:
-		return ""
-	}
-}
-
 func runLegacyTextTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
-	var payload map[string]interface{}
 	responseInput, err := textResponseInput(input)
 	if err != nil {
 		return nil, err
 	}
 	body := map[string]interface{}{"model": input.Config.Model, "input": responseInput}
-	if err := postJSON(ctx, input.Config, "/responses", body, &payload); err != nil {
+	text, err := requestTextProvider(ctx, input.Config, "/responses", body, "responses", input.StreamText)
+	if err != nil {
 		if !shouldFallbackTextToChat(err) {
 			return nil, err
 		}
@@ -922,37 +937,23 @@ func runLegacyTextTask(ctx context.Context, input canvasGenerationInput) (map[st
 		}
 		return nil, fmt.Errorf("文本接口请求失败：Responses API %v；Chat Completions %v", err, chatErr)
 	}
-	text := stringField(payload, "output_text")
-	if text == "" {
-		text = extractResponseText(payload)
-	}
-	if text == "" {
-		return nil, errors.New("文本接口没有返回内容")
-	}
 	return map[string]interface{}{"mode": "text", "text": text}, nil
 }
 
 func runResponsesTextTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
-	var payload map[string]interface{}
 	responseInput, err := textResponseInput(input)
 	if err != nil {
 		return nil, err
 	}
-	if err := postJSON(ctx, input.Config, "/responses", map[string]interface{}{"model": input.Config.Model, "input": responseInput}, &payload); err != nil {
+	body := map[string]interface{}{"model": input.Config.Model, "input": responseInput}
+	text, err := requestTextProvider(ctx, input.Config, "/responses", body, "responses", input.StreamText)
+	if err != nil {
 		return nil, err
-	}
-	text := stringField(payload, "output_text")
-	if text == "" {
-		text = extractResponseText(payload)
-	}
-	if text == "" {
-		return nil, errors.New("文本接口没有返回内容")
 	}
 	return map[string]interface{}{"mode": "text", "text": text}, nil
 }
 
 func runChatCompletionsTextTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
-	var payload map[string]interface{}
 	messages := []map[string]interface{}{}
 	if systemPrompt := strings.TrimSpace(input.Config.SystemPrompt); systemPrompt != "" {
 		messages = append(messages, map[string]interface{}{"role": "system", "content": systemPrompt})
@@ -963,12 +964,9 @@ func runChatCompletionsTextTask(ctx context.Context, input canvasGenerationInput
 	}
 	messages = append(messages, map[string]interface{}{"role": "user", "content": userContent})
 	body := map[string]interface{}{"model": input.Config.Model, "messages": messages}
-	if err := postJSON(ctx, input.Config, "/chat/completions", body, &payload); err != nil {
+	text, err := requestTextProvider(ctx, input.Config, "/chat/completions", body, "chat-completion", input.StreamText)
+	if err != nil {
 		return nil, err
-	}
-	text := extractChatCompletionText(payload)
-	if text == "" {
-		return nil, errors.New("文本接口没有返回内容")
 	}
 	return map[string]interface{}{"mode": "text", "text": text}, nil
 }
@@ -1086,9 +1084,6 @@ func runAudioTask(ctx context.Context, input canvasGenerationInput) (map[string]
 		if voiceKey == "" || strings.TrimSpace(input.Config.AudioVoice) != voiceKey {
 			return nil, errors.New("角色配音缺少已解析的声音绑定")
 		}
-	}
-	if input.Config.InterfaceType == string(model.ChannelInterfaceVolcenginePlanTTS) {
-		return runVolcenginePlanTTSTask(ctx, input)
 	}
 	format := defaultString(input.Config.AudioFormat, "mp3")
 	body := map[string]interface{}{
@@ -1389,19 +1384,11 @@ func runVideoTask(ctx context.Context, input canvasGenerationInput) (map[string]
 		}
 	}
 	if id == "" {
-		if input.Config.InterfaceType == "xai-video" {
-			id = firstNonEmptyString(stringField(created, "request_id"), stringField(created, "id"), stringField(created, "task_id"))
-		} else {
-			id = firstNonEmptyString(stringField(created, "id"), stringField(created, "request_id"), stringField(created, "task_id"))
-		}
+		id = firstNonEmptyString(stringField(created, "id"), stringField(created, "request_id"), stringField(created, "task_id"))
 	}
 	if id == "" {
 		if data, ok := created["data"].(map[string]interface{}); ok {
-			if input.Config.InterfaceType == "xai-video" {
-				id = firstNonEmptyString(stringField(data, "request_id"), stringField(data, "id"), stringField(data, "task_id"))
-			} else {
-				id = firstNonEmptyString(stringField(data, "id"), stringField(data, "request_id"), stringField(data, "task_id"))
-			}
+			id = firstNonEmptyString(stringField(data, "id"), stringField(data, "request_id"), stringField(data, "task_id"))
 		}
 	}
 	if id == "" {
@@ -1419,21 +1406,11 @@ func runVideoTask(ctx context.Context, input canvasGenerationInput) (map[string]
 		if status == "completed" || status == "succeeded" || status == "success" || status == "done" {
 			if videoURL := newAPIVideoResultURL(state); videoURL != "" {
 				data, mimeType, err := getProviderExternalBinary(withProviderRequestKind(ctx, "download"), input.Config, videoURL)
-				if err == nil {
-					mimeType = normalizedMediaMimeType(mimeType, data)
-					return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType}}, nil
+				if err != nil {
+					return nil, fmt.Errorf("视频结果下载失败（任务 %s）：%w", id, err)
 				}
-				// Grok2API may expose a private result URL. Its authenticated content
-				// endpoint is the safe fallback instead of allowing a private URL fetch.
-				if input.Config.InterfaceType == "xai-video" || isGrokVideoConfig(input.Config) {
-					content, contentMimeType, contentErr := getBinary(ctx, input.Config, "/videos/"+url.PathEscape(id)+"/content")
-					if contentErr == nil {
-						contentMimeType = normalizedMediaMimeType(contentMimeType, content)
-						return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(contentMimeType, content), "mimeType": contentMimeType}}, nil
-					}
-					return nil, fmt.Errorf("视频结果下载失败（任务 %s）：%w；内容接口回退失败：%v", id, err, contentErr)
-				}
-				return nil, fmt.Errorf("视频结果下载失败（任务 %s）：%w", id, err)
+				mimeType = normalizedMediaMimeType(mimeType, data)
+				return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType}}, nil
 			}
 			data, mimeType, err := getBinary(ctx, input.Config, "/videos/"+id+"/content")
 			if err != nil {
@@ -1449,41 +1426,6 @@ func runVideoTask(ctx context.Context, input canvasGenerationInput) (map[string]
 		}
 	}
 	return nil, errors.New("视频生成超时")
-}
-
-func queryXAIVideoTask(ctx context.Context, input canvasGenerationInput, id string) (map[string]interface{}, string, error) {
-	var state map[string]interface{}
-	if err := getJSON(ctx, input.Config, "/videos/"+url.PathEscape(id), &state); err != nil {
-		return nil, "", err
-	}
-	if data, ok := state["data"].(map[string]interface{}); ok {
-		state = data
-	}
-	status := strings.ToLower(stringField(state, "status"))
-	if status != "completed" && status != "succeeded" && status != "success" && status != "done" {
-		if status == "failed" || status == "cancelled" {
-			return nil, status, errors.New("视频生成失败")
-		}
-		return nil, status, nil
-	}
-	if videoURL := newAPIVideoResultURL(state); videoURL != "" {
-		data, mimeType, err := getProviderExternalBinary(withProviderRequestKind(ctx, "download"), input.Config, videoURL)
-		if err == nil {
-			mimeType = normalizedMediaMimeType(mimeType, data)
-			return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType}}, status, nil
-		}
-		content, contentMimeType, contentErr := getBinary(ctx, input.Config, "/videos/"+url.PathEscape(id)+"/content")
-		if contentErr == nil {
-			contentMimeType = normalizedMediaMimeType(contentMimeType, content)
-			return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(contentMimeType, content), "mimeType": contentMimeType}}, status, nil
-		}
-		return nil, status, fmt.Errorf("视频结果下载失败（任务 %s）：%w；内容接口回退失败：%v", id, err, contentErr)
-	}
-	data, mimeType, err := getBinary(ctx, input.Config, "/videos/"+url.PathEscape(id)+"/content")
-	if err != nil {
-		return nil, status, err
-	}
-	return map[string]interface{}{"mode": "video", "video": map[string]interface{}{"dataUrl": dataURL(mimeType, data), "mimeType": mimeType}}, status, nil
 }
 
 func runGeminiVeoVideoTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
@@ -2061,7 +2003,7 @@ func validateGenerationInterface(mode string, interfaceType string) error {
 	}
 	allowed := map[string]map[string]bool{
 		"text":  {"chat-completion": true, "openai-response": true},
-		"image": {"openai-image": true, "xai-image": true, "volcengine-ark-image": true, "volcengine-jimeng-image": true},
+		"image": {"openai-image": true, "grok-image": true, "volcengine-ark-image": true, "volcengine-jimeng-image": true},
 		"video": {"newapi": true, "newapi-channel-1": true, "newapi-channel-2": true, "xai-video": true, "volcengine-ark-video": true, "volcengine-jimeng-video": true, "gemini-veo": true},
 		"audio": {"openai-audio": true, "async-audio": true},
 	}
@@ -2270,6 +2212,170 @@ func runSeedanceAgentPlanVideoTask(ctx context.Context, input canvasGenerationIn
 	return nil, fmt.Errorf("%s视频生成超时", providerName)
 }
 
+func requestTextProvider(ctx context.Context, config providerConfig, path string, body map[string]interface{}, protocol string, stream bool) (string, error) {
+	if stream {
+		return postStreamingText(ctx, config, path, body, protocol)
+	}
+	var payload map[string]interface{}
+	if err := postJSON(ctx, config, path, body, &payload); err != nil {
+		return "", err
+	}
+	text := extractTextPayload(payload, protocol)
+	if text == "" {
+		return "", errors.New("文本接口没有返回内容")
+	}
+	return text, nil
+}
+
+func postStreamingText(ctx context.Context, config providerConfig, path string, body map[string]interface{}, protocol string) (string, error) {
+	// 只把分镜规划/修复切到上游 SSE，完整 JSON 仍在流结束后校验，避免半截结构污染画布。
+	body["stream"] = true
+	data, mimeType, err := postStreamingBinary(ctx, config, path, body)
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(strings.ToLower(mimeType), "event-stream") {
+		var payload map[string]interface{}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return "", fmt.Errorf("流式文本接口返回格式无效：%w", err)
+		}
+		if err := validateTextPayload(payload); err != nil {
+			return "", err
+		}
+		text := extractTextPayload(payload, protocol)
+		if text == "" {
+			return "", errors.New("文本接口没有返回内容")
+		}
+		return text, nil
+	}
+	return parseTextEventStream(data, protocol)
+}
+
+func extractTextPayload(payload map[string]interface{}, protocol string) string {
+	if protocol == "responses" {
+		text := stringField(payload, "output_text")
+		if text == "" {
+			text = extractResponseText(payload)
+		}
+		return text
+	}
+	return extractChatCompletionText(payload)
+}
+
+func validateTextPayload(payload map[string]interface{}) error {
+	if code, ok := payload["code"].(float64); ok && code != 0 {
+		return errors.New(defaultString(stringField(payload, "msg"), "请求失败"))
+	}
+	if errValue, ok := payload["error"].(map[string]interface{}); ok {
+		if message := stringField(errValue, "message"); message != "" {
+			return errors.New(message)
+		}
+	}
+	return nil
+}
+
+func parseTextEventStream(data []byte, protocol string) (string, error) {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 64<<10), len(data)+1)
+	var text strings.Builder
+	var eventName string
+	var dataLines []string
+
+	flush := func() error {
+		if len(dataLines) == 0 {
+			eventName = ""
+			return nil
+		}
+		raw := strings.TrimSpace(strings.Join(dataLines, "\n"))
+		dataLines = nil
+		if raw == "" || raw == "[DONE]" {
+			eventName = ""
+			return nil
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			return fmt.Errorf("流式文本事件解析失败：%w", err)
+		}
+		if eventName == "error" {
+			if err := validateTextPayload(payload); err != nil {
+				return err
+			}
+			return errors.New("上游流式文本请求失败")
+		}
+		if err := validateTextPayload(payload); err != nil {
+			return err
+		}
+		if protocol == "responses" {
+			text.WriteString(stringField(payload, "delta"))
+		} else {
+			choices, _ := payload["choices"].([]interface{})
+			for _, choice := range choices {
+				record, _ := choice.(map[string]interface{})
+				delta, _ := record["delta"].(map[string]interface{})
+				text.WriteString(streamContentText(delta["content"]))
+			}
+		}
+		eventName = ""
+		return nil
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if line == "" {
+			if err := flush(); err != nil {
+				return "", err
+			}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		case strings.HasPrefix(line, "data:"):
+			value := strings.TrimPrefix(line, "data:")
+			dataLines = append(dataLines, strings.TrimPrefix(value, " "))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("读取流式文本响应失败：%w", err)
+	}
+	if err := flush(); err != nil {
+		return "", err
+	}
+	if text.Len() == 0 {
+		return "", errors.New("流式文本接口没有返回内容")
+	}
+	return text.String(), nil
+}
+
+func streamContentText(value interface{}) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	parts, ok := value.([]interface{})
+	if !ok {
+		return ""
+	}
+	var result strings.Builder
+	for _, part := range parts {
+		record, _ := part.(map[string]interface{})
+		result.WriteString(stringField(record, "text"))
+	}
+	return result.String()
+}
+
+func postStreamingBinary(ctx context.Context, config providerConfig, path string, body interface{}) ([]byte, string, error) {
+	data, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL(config.BaseURL, path), bytes.NewReader(data))
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	ApplyOutboundHeaders(req, config.Headers)
+	return doBinary(req)
+}
+
 func postJSON(ctx context.Context, config providerConfig, path string, body interface{}, target interface{}) error {
 	data, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL(config.BaseURL, path), bytes.NewReader(data))
@@ -2280,19 +2386,6 @@ func postJSON(ctx context.Context, config providerConfig, path string, body inte
 	req.Header.Set("Content-Type", "application/json")
 	ApplyOutboundHeaders(req, config.Headers)
 	return doJSON(req, target)
-}
-
-func postTextEventStream(ctx context.Context, config providerConfig, path string, body interface{}, onEvent func(string, string) error, onJSON func([]byte) error) (bool, error) {
-	data, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL(config.BaseURL, path), bytes.NewReader(data))
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Authorization", "Bearer "+config.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	ApplyOutboundHeaders(req, config.Headers)
-	return doTextEventStream(req, onEvent, onJSON)
 }
 
 func postForm(ctx context.Context, config providerConfig, path string, contentType string, body io.Reader, target interface{}) error {
@@ -2395,134 +2488,6 @@ func doJSON(req *http.Request, target interface{}) error {
 		}
 	}
 	return nil
-}
-
-func doTextEventStream(req *http.Request, onEvent func(string, string) error, onJSON func([]byte) error) (bool, error) {
-	startedAt := time.Now()
-	requestTimeout := providerHTTPTimeout
-	if deadline, ok := req.Context().Deadline(); ok {
-		if remaining := time.Until(deadline); remaining > 0 {
-			requestTimeout = remaining
-		}
-	}
-	var release func()
-	var coordinator *runtimeCoordinator
-	var runtimeService *Service
-	channelID := ""
-	if metadata, ok := req.Context().Value(providerAnalyticsKey{}).(providerAnalyticsContext); ok && metadata.Service != nil {
-		runtimeService = metadata.Service
-		coordinator = metadata.Service.coordinator
-		channelID = metadata.ChannelID
-		open, err := coordinator.circuitOpen(req.Context(), channelID)
-		if err != nil {
-			return false, fmt.Errorf("读取渠道熔断状态失败：%w", err)
-		}
-		if open {
-			return false, errors.New("当前渠道连续失败，已暂时熔断，请稍后重试")
-		}
-		slotID := channelID
-		if slotID == "" {
-			slotID = "custom:" + strings.ToLower(req.URL.Host)
-		}
-		acquiredRelease, _, acquireErr := metadata.Service.AcquireChannelSlot(req.Context(), channelID, slotID, requestTimeout+time.Minute)
-		if acquireErr != nil {
-			recordProviderRequest(req, startedAt, 0, nil, acquireErr)
-			return false, acquireErr
-		}
-		release = acquiredRelease
-		defer release()
-	}
-	if _, err := ValidateOutboundURL(req.URL.String()); err != nil {
-		recordProviderRequest(req, startedAt, 0, nil, err)
-		return false, err
-	}
-	ApplyDefaultOutboundHeaders(req)
-	resp, err := OutboundHTTPClient(requestTimeout).Do(req)
-	if err != nil {
-		if runtimeService != nil {
-			_ = runtimeService.RecordChannelResult(req.Context(), channelID, !errors.Is(err, context.Canceled))
-		}
-		recordProviderRequest(req, startedAt, 0, nil, err)
-		return false, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, maxTextStreamResponseBytes+1))
-		err := providerHTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(data)}
-		if runtimeService != nil {
-			_ = runtimeService.RecordChannelResult(req.Context(), channelID, resp.StatusCode >= 500)
-		}
-		recordProviderRequest(req, startedAt, resp.StatusCode, data, err)
-		return false, err
-	}
-	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxTextStreamResponseBytes+1))
-		if readErr != nil {
-			recordProviderRequest(req, startedAt, resp.StatusCode, nil, readErr)
-			return false, readErr
-		}
-		if int64(len(data)) > maxTextStreamResponseBytes {
-			err := fmt.Errorf("文本响应超过 %s 限制", formatStorageLimit(maxTextStreamResponseBytes))
-			recordProviderRequest(req, startedAt, resp.StatusCode, nil, err)
-			return false, err
-		}
-		if err := onJSON(data); err != nil {
-			recordProviderRequest(req, startedAt, resp.StatusCode, nil, err)
-			return false, err
-		}
-		recordProviderRequest(req, startedAt, resp.StatusCode, nil, nil)
-		if runtimeService != nil {
-			_ = runtimeService.RecordChannelResult(req.Context(), channelID, false)
-		}
-		return false, nil
-	}
-
-	scanner := bufio.NewScanner(io.LimitReader(resp.Body, maxTextStreamResponseBytes+1))
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	eventName := "message"
-	dataLines := make([]string, 0, 2)
-	dispatch := func() error {
-		if len(dataLines) == 0 {
-			return nil
-		}
-		err := onEvent(eventName, strings.Join(dataLines, "\n"))
-		eventName = "message"
-		dataLines = dataLines[:0]
-		return err
-	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			if err := dispatch(); err != nil {
-				recordProviderRequest(req, startedAt, resp.StatusCode, nil, err)
-				return true, err
-			}
-			continue
-		}
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		if strings.HasPrefix(line, "event:") {
-			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		recordProviderRequest(req, startedAt, resp.StatusCode, nil, err)
-		return true, err
-	}
-	if err := dispatch(); err != nil {
-		recordProviderRequest(req, startedAt, resp.StatusCode, nil, err)
-		return true, err
-	}
-	recordProviderRequest(req, startedAt, resp.StatusCode, nil, nil)
-	if runtimeService != nil {
-		_ = runtimeService.RecordChannelResult(req.Context(), channelID, false)
-	}
-	return true, nil
 }
 
 func doBinary(req *http.Request) ([]byte, string, error) {
@@ -2782,9 +2747,7 @@ func imageDataURLs(payload imageResponse) ([]map[string]string, error) {
 			continue
 		}
 		if url, ok := item["url"].(string); ok && url != "" {
-			// Provider image URLs are temporary. Mark them explicitly so the result
-			// persistence path can copy the image into the user's resource storage.
-			images = append(images, map[string]string{"providerImageURL": url})
+			images = append(images, map[string]string{"dataUrl": url})
 		}
 	}
 	if len(images) == 0 {
