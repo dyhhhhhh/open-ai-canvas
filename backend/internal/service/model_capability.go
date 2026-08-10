@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"infinite-canvas/backend/internal/model"
 )
@@ -109,8 +108,9 @@ func DefaultImageCapabilityConfig(protocol string, modelName string) *ImageCapab
 	case model.ChannelInterfaceGrokImage, model.ChannelInterfaceXAIImageLegacy:
 		image.References.MaxImages = 1
 		image.References.MaskSupported = false
-		image.Size = ImageSizeConfig{Parameter: "none", Values: []string{}, Default: "auto", AllowCustom: false}
-		image.Quality = ImageQualityConfig{Supported: false, Values: []string{}, Default: "auto"}
+		// grok2api / xAI Imagine：size→aspect_ratio，quality→resolution(1k/2k)。
+		image.Size = ImageSizeConfig{Parameter: "aspect_ratio", Values: []string{"1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2"}, Default: "1:1", AllowCustom: false}
+		image.Quality = ImageQualityConfig{Supported: true, Values: []string{"1k", "2k"}, Default: "2k"}
 		image.TransparentBackground = VideoBooleanConfig{Supported: false, Default: false}
 		image.ResponseFormat = ParameterSupport{Supported: true}
 		image.OutputFormat = ParameterSupport{Supported: false}
@@ -132,8 +132,8 @@ func DefaultImageCapabilityConfig(protocol string, modelName string) *ImageCapab
 	if model.ChannelInterfaceType(protocol) != model.ChannelInterfaceGrokImage && model.ChannelInterfaceType(protocol) != model.ChannelInterfaceXAIImageLegacy && strings.HasPrefix(strings.ToLower(strings.TrimSpace(modelName)), "grok-imagine-image") {
 		image.References.MaxImages = 0
 		image.References.MaskSupported = false
-		image.Size = ImageSizeConfig{Parameter: "none", Values: []string{}, Default: "auto", AllowCustom: false}
-		image.Quality = ImageQualityConfig{Supported: false, Values: []string{}, Default: "auto"}
+		image.Size = ImageSizeConfig{Parameter: "aspect_ratio", Values: []string{"1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2"}, Default: "1:1", AllowCustom: false}
+		image.Quality = ImageQualityConfig{Supported: true, Values: []string{"1k", "2k"}, Default: "2k"}
 		image.TransparentBackground = VideoBooleanConfig{Supported: false, Default: false}
 		image.ResponseFormat = ParameterSupport{Supported: true}
 		image.OutputFormat = ParameterSupport{Supported: false}
@@ -354,9 +354,6 @@ func (s *Service) ValidateTaskCapability(input map[string]any) error {
 }
 
 func validateVideoTask(profile *VideoCapabilityConfig, input canvasGenerationInput) error {
-	if utf8.RuneCountInString(input.Prompt) > profile.References.PromptMaxChars {
-		return BadAuthRequest(fmt.Sprintf("提示词超过当前模型限制（最多 %d 字）", profile.References.PromptMaxChars))
-	}
 	if len(input.ReferenceImages) > profile.References.MaxImages || len(input.ReferenceVideos) > profile.References.MaxVideos || len(input.ReferenceAudios) > profile.References.MaxAudios {
 		return BadAuthRequest("参考素材数量超过当前模型限制")
 	}
@@ -408,9 +405,6 @@ func validateVideoTask(profile *VideoCapabilityConfig, input canvasGenerationInp
 func validateImageTask(profile *ImageCapabilityConfig, input canvasGenerationInput) error {
 	if profile == nil {
 		return nil
-	}
-	if utf8.RuneCountInString(input.Prompt) > profile.References.PromptMaxChars {
-		return BadAuthRequest(fmt.Sprintf("提示词超过当前模型限制（最多 %d 字）", profile.References.PromptMaxChars))
 	}
 	if len(input.ReferenceImages) > profile.References.MaxImages {
 		return BadAuthRequest(fmt.Sprintf("当前图片模型最多支持 %d 张参考图", profile.References.MaxImages))
