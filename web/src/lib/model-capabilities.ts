@@ -301,6 +301,20 @@ export function defaultModelCapabilityConfig(protocol?: ModelProtocol, model = "
         video.resolutions = ["1080p"];
         video.defaultResolution = "1080p";
     }
+    if (protocol === "minimax-h3") {
+        video.references.maxVideos = 3;
+        video.references.maxAudios = 3;
+        video.references.maxVideoBytes = 200 * 1024 * 1024;
+        video.references.maxAudioBytes = 15 * 1024 * 1024;
+        video.references.maxVideoDurationSeconds = 15;
+        video.references.maxAudioDurationSeconds = 15;
+        video.duration = { selection: "range", min: 1, max: 300, step: 1, default: 6 };
+        video.ratios = ["16:9", "9:16", "1:1"];
+        video.resolutions = ["720p", "1080p"];
+        video.defaultResolution = "720p";
+        video.generateAudio = { supported: true, default: true };
+        video.operations = ["text_to_video", "image_to_video", "first_last_frame"];
+    }
     return { version: 1, text, image: defaultImageCapabilityConfig(protocol, model), video };
 }
 
