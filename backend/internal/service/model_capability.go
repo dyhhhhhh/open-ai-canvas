@@ -220,6 +220,17 @@ func DefaultModelCapabilityConfigForModel(protocol string, modelName string) *Mo
 		if model.ChannelInterfaceType(protocol) == model.ChannelInterfaceNewAPIChannel1 {
 			video.Resolutions = []string{"480p", "720p", "1080p"}
 		}
+	case model.ChannelInterfaceMiniMaxH3Video:
+		video.References.MaxImageBytes = 64 * 1024 * 1024
+		video.References.MaxVideos, video.References.MaxAudios = 3, 3
+		video.References.MaxVideoBytes, video.References.MaxAudioBytes = 64*1024*1024, 64*1024*1024
+		video.References.MaxVideoDuration, video.References.MaxAudioDuration = 15, 15
+		video.Duration = VideoDurationConfig{Selection: "range", Min: 1, Max: 300, Step: 1, Default: 5}
+		video.Ratios = []string{"1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9"}
+		video.DefaultRatio = "9:16"
+		video.Resolutions = []string{"720p", "1080p"}
+		video.DefaultResolution = "720p"
+		video.Operations = []string{"text_to_video", "image_to_video", "first_last_frame", "audio_to_video", "extend", "video_to_video"}
 	case model.ChannelInterfaceNewAPIVideo, model.ChannelInterfaceXAIVideo:
 		video.GenerateAudio = VideoBooleanConfig{Supported: false, Default: false}
 	case model.ChannelInterfaceNovitaVideo:

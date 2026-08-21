@@ -12,6 +12,7 @@ export type ModelProtocol =
     | "newapi"
     | "newapi-channel-1"
     | "newapi-channel-2"
+    | "minimax-h3"
     | "xai-video"
     | "volcengine-ark-video"
     | "volcengine-jimeng-video"
@@ -52,6 +53,7 @@ export const MODEL_PROTOCOLS: ModelProtocolDefinition[] = [
         contentType: "application/json",
         media: "image_urls（首帧、尾帧、其他参考图） / video_urls / audio_urls",
     },
+    { value: "minimax-h3", label: "MiniMax H3", capability: "video", create: "POST /v1/videos", poll: "GET /v1/videos/{task_id}", contentType: "application/json / multipart", media: "文本、图片、视频与音频参考素材" },
     { value: "xai-video", label: "xAI 官方视频", capability: "video", create: "POST /v1/videos/generations", poll: "GET /v1/videos/{request_id}", contentType: "application/json", media: "单张起始图" },
     {
         value: "volcengine-ark-video",
