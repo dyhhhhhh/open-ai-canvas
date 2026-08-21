@@ -90,15 +90,44 @@ type ProjectCharacterDetail struct {
 	Character CharacterCardSummary `json:"character"`
 }
 
-var builtinVoiceNames = []string{"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar"}
+type builtinVoiceProfile struct {
+	Name                 string
+	Provider             string
+	VoiceKey             string
+	Language             string
+	Timbre               string
+	CompatibleModelsJSON string
+}
+
+var builtinVoiceProfiles = []builtinVoiceProfile{
+	{Name: "Alloy", Provider: "openai_compatible", VoiceKey: "alloy", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Ash", Provider: "openai_compatible", VoiceKey: "ash", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Ballad", Provider: "openai_compatible", VoiceKey: "ballad", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Coral", Provider: "openai_compatible", VoiceKey: "coral", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Echo", Provider: "openai_compatible", VoiceKey: "echo", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Fable", Provider: "openai_compatible", VoiceKey: "fable", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Nova", Provider: "openai_compatible", VoiceKey: "nova", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Onyx", Provider: "openai_compatible", VoiceKey: "onyx", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Sage", Provider: "openai_compatible", VoiceKey: "sage", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Shimmer", Provider: "openai_compatible", VoiceKey: "shimmer", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Verse", Provider: "openai_compatible", VoiceKey: "verse", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Marin", Provider: "openai_compatible", VoiceKey: "marin", Language: "多语言", CompatibleModelsJSON: "[]"},
+	{Name: "Cedar", Provider: "openai_compatible", VoiceKey: "cedar", Language: "多语言", CompatibleModelsJSON: "[]"},
+	// Seed TTS 2.0 accepts these native speaker IDs. Keep them explicit instead of
+	// mapping every generic profile to the same default Chinese voice.
+	{Name: "小何 2.0（青年女声）", Provider: "volcengine-plan-tts", VoiceKey: "zh_female_xiaohe_uranus_bigtts", Language: "中文普通话", Timbre: "青年女声，温暖、自然", CompatibleModelsJSON: "[\"seed-tts-2.0\"]"},
+	{Name: "灿灿 2.0（成熟女声）", Provider: "volcengine-plan-tts", VoiceKey: "zh_female_cancan_uranus_bigtts", Language: "中文普通话", Timbre: "成熟女声，温厚、克制", CompatibleModelsJSON: "[\"seed-tts-2.0\"]"},
+	{Name: "Vivi 2.0（温柔女声）", Provider: "volcengine-plan-tts", VoiceKey: "zh_female_vv_uranus_bigtts", Language: "中文普通话", Timbre: "女声，平稳、柔和", CompatibleModelsJSON: "[\"seed-tts-2.0\"]"},
+}
 
 func (s *Service) ListVoiceProfiles(userID string) ([]VoiceProfileSummary, error) {
 	now := time.Now()
-	profiles := make([]model.VoiceProfile, 0, len(builtinVoiceNames))
-	for _, key := range builtinVoiceNames {
+	profiles := make([]model.VoiceProfile, 0, len(builtinVoiceProfiles))
+	for _, definition := range builtinVoiceProfiles {
 		profiles = append(profiles, model.VoiceProfile{
-			ID: newID(), UserID: userID, Name: strings.ToUpper(key[:1]) + key[1:], Provider: "openai_compatible", VoiceKey: key,
-			Language: "多语言", CompatibleModelsJSON: "[]", Status: "active", CreatedAt: now, UpdatedAt: now,
+			ID: newID(), UserID: userID, Name: definition.Name, Provider: definition.Provider, VoiceKey: definition.VoiceKey,
+			Language: definition.Language, Timbre: definition.Timbre, CompatibleModelsJSON: definition.CompatibleModelsJSON,
+			Status: "active", CreatedAt: now, UpdatedAt: now,
 		})
 	}
 	if err := s.repo.EnsureVoiceProfiles(profiles); err != nil {
