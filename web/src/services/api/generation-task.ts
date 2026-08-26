@@ -6,11 +6,24 @@ import { LOCAL_DREAMINA_WAIT_STOPPED_CODE, LocalDreaminaGenerationClientError, r
 import { isLocalDreaminaBackgroundTask, localDreaminaTaskId, projectLocalDreaminaTask, stripLocalDreaminaTaskPrefix } from "@/services/local-dreamina-task-projection";
 import { modelCapabilityConfigFor } from "@/lib/model-capabilities";
 import { grokImagePromptLimitError } from "@/lib/grok-image-prompt-limit";
-import { modelOptionName, resolveModelChannel, resolveModelRequestConfig, type AiConfig } from "@/stores/use-config-store";
+import { resolveVideoOperation } from "@/lib/model-selection";
+import { logicalModelIDForConfig, modelOptionName, resolveModelChannel, resolveModelRequestConfig, type AiConfig } from "@/stores/use-config-store";
 import { useLocalDreaminaModelStore } from "@/stores/use-local-dreamina-model-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 import { buildBackendToolRequests, type ResponseFunctionTool, type ResponseInputMessage, type ToolChoice, type ToolResponseResult } from "@/services/api/image";
+
+export { logicalModelIDForConfig };
+
+// 只要模型明确选择了请求协议，就统一交给后端协议运行时执行：逻辑模型
+// 由逻辑模型路由解析协议，系统渠道由 channelId 解析真实渠道模型，用户
+// 自建渠道则由所选协议插件负责第三方字段映射和结果解析。没有显式协议
+// 的旧配置继续保留前端直连兼容路径。
+export function backendModelRuntimeRequired(config: AiConfig) {
+    if (logicalModelIDForConfig(config)) return true;
+    const requestConfig = resolveModelRequestConfig(config, config.model);
+    return Boolean(requestConfig.channelId || requestConfig.interfaceType);
+}
 
 export type BackendGenerationMode = "text" | "image" | "video" | "audio";
 
@@ -118,13 +131,14 @@ export async function runBackendToolGenerationTask(options: {
 }): Promise<ToolResponseResult> {
     throwIfAborted(options.signal);
     const logicalModelId = logicalModelIDForConfig(options.config);
-    if (!logicalModelId) throw new Error("当前模型不是平台系统模型");
+    const requestConfig = resolveModelRequestConfig(options.config, options.config.model);
+    if (!logicalModelId && !requestConfig.channelId && !requestConfig.interfaceType) throw new Error("当前模型未选择可用请求协议");
     const task = await createGenerationTask({
         type: "canvas_text",
         operation: "text",
         prompt: options.prompt,
         model: options.config.model,
-        logicalModelId,
+        ...(logicalModelId ? { logicalModelId } : {}),
         input: {
             mode: "text",
             prompt: options.prompt,
@@ -268,10 +282,13 @@ async function runLocalDreaminaGeneration(options: BackendGenerationTaskOptions,
 
 function generationOperation(options: BackendGenerationTaskOptions) {
     if (options.mode !== "video") return options.mode;
-    const imageCount = options.referenceImages?.length ?? 0;
-    if ((options.referenceVideos?.length ?? 0) > 0 || (options.referenceAudios?.length ?? 0) > 0 || imageCount > 2) return "reference_to_video";
-    if (imageCount > 0) return "image_to_video";
-    return "text_to_video";
+    return resolveVideoOperation({
+        textCount: 0,
+        imageCount: options.referenceImages?.length ?? 0,
+        videoCount: options.referenceVideos?.length ?? 0,
+        audioCount: options.referenceAudios?.length ?? 0,
+        characterCount: 0,
+    }, options.metadata?.videoEditOperation as string | undefined);
 }
 
 export function isGenerationTaskCancelled(error: unknown, signal?: AbortSignal) {
@@ -475,6 +492,7 @@ export function backendProviderConfig(config: AiConfig) {
         vquality: config.vquality,
         videoGenerateAudio: config.videoGenerateAudio,
         videoWatermark: config.videoWatermark,
+        videoArkPrivateAssetUpload: config.videoArkPrivateAssetUpload,
         audioVoice: config.audioVoice,
         audioFormat: config.audioFormat,
         audioSpeed: config.audioSpeed,
@@ -494,11 +512,6 @@ export function backendProviderConfig(config: AiConfig) {
         capabilityConfig: modelCapabilityConfigFor(config, requestConfig.model),
         systemPrompt: "",
     };
-}
-
-export function logicalModelIDForConfig(config: AiConfig) {
-    const channel = resolveModelChannel(config, config.model);
-    return channel.modelCosts?.find((item) => item.model === modelOptionName(config.model))?.logicalModelId || "";
 }
 
 function logicalCapabilityOptions(config: AiConfig, mode: BackendGenerationMode) {

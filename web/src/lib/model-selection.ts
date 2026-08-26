@@ -145,7 +145,10 @@ function logicalModelCompatibilityError(spec: NonNullable<NonNullable<AiConfig["
 }
 
 function logicalOptionMatches(name: string, constraint: { values?: unknown[]; min?: number; max?: number; step?: number }, value: unknown) {
-    if (constraint.values?.length) return constraint.values.some((candidate) => logicalOptionValueMatches(name, candidate, value));
+    if (constraint.values?.length) {
+        const requested = normalizeLogicalOptionValue(name, value);
+        return constraint.values.some((candidate) => normalizeLogicalOptionValue(name, candidate) === requested);
+    }
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return false;
     if (constraint.min !== undefined && numeric < constraint.min) return false;
@@ -154,11 +157,15 @@ function logicalOptionMatches(name: string, constraint: { values?: unknown[]; mi
     return true;
 }
 
-function logicalOptionValueMatches(name: string, candidate: unknown, value: unknown) {
-    const left = String(candidate).trim().toLowerCase();
-    const right = String(value).trim().toLowerCase();
-    if (name === "vquality" || name === "resolution") return left.replace(/p$/, "") === right.replace(/p$/, "");
-    return left === right;
+function normalizeLogicalOptionValue(name: string, value: unknown) {
+    const normalized = String(value).trim().toLowerCase();
+    if (name !== "vquality" && name !== "resolution") return normalized;
+    if (normalized === "low") return "480p";
+    if (["auto", "medium", "high"].includes(normalized)) return "720p";
+    if (normalized === "2k") return "1440p";
+    if (normalized === "4k") return "2160p";
+    const resolution = normalized.replace(/p$/i, "");
+    return resolution ? `${resolution}p` : "";
 }
 
 function logicalOptionError(name: string) {
@@ -312,14 +319,16 @@ export function modelGroupReferenceLimits(config: AiConfig, selected: string, ca
 
 export function inferVideoOperation(input: ModelInputSummary) {
     const visualInputCount = input.imageCount + input.characterCount;
-    if (input.audioCount > 0 && visualInputCount === 0 && input.videoCount === 0) return "audio_to_video";
-    if (input.videoCount > 0) return "extend";
+    // 纯音频参考使用独立能力；音频与图片、角色或视频组合时属于全模态参考，
+    // 不能把组合请求误路由到只支持 audio_to_video 的细分模型。
+    if (input.audioCount > 0) return visualInputCount > 0 || input.videoCount > 0 ? "reference_to_video" : "audio_to_video";
+    if (input.videoCount > 0 || visualInputCount > 2) return "reference_to_video";
     if (visualInputCount > 0) return "image_to_video";
     return "text_to_video";
 }
 
 export function resolveVideoOperation(input: ModelInputSummary, storedOperation?: string) {
-    if (storedOperation && !["text_to_video", "image_to_video", "audio_to_video", "extend"].includes(storedOperation)) return storedOperation;
+    if (storedOperation && !["text_to_video", "image_to_video", "audio_to_video", "extend", "reference_to_video"].includes(storedOperation)) return storedOperation;
     return inferVideoOperation(input);
 }
 
@@ -327,6 +336,7 @@ function videoOperationLabel(operation: string) {
     if (operation === "text_to_video") return "文生视频";
     if (operation === "image_to_video") return "图生视频";
     if (operation === "audio_to_video") return "音频生视频";
+    if (operation === "reference_to_video") return "全模态参考";
     if (operation === "extend") return "视频续写";
     return "当前生成模式";
 }

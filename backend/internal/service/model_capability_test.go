@@ -83,6 +83,50 @@ func TestDefaultVideoCapabilityUsesProtocolSpecificResolutionTiers(t *testing.T)
 	}
 }
 
+func TestDefaultMiniMaxVideoCapabilitySupportsReferenceGeneration(t *testing.T) {
+	profile := DefaultModelCapabilityConfigForModel("minimax-video", "MiniMax-H3")
+	if profile == nil || profile.Video == nil {
+		t.Fatal("MiniMax video profile = nil")
+	}
+	if !containsCapabilityString(profile.Video.Operations, "reference_to_video") {
+		t.Fatalf("operations = %v, want reference_to_video", profile.Video.Operations)
+	}
+}
+
+func TestDefaultVolcengineArkVideoCapabilitySupportsFullModalReference(t *testing.T) {
+	profile := DefaultModelCapabilityConfigForModel("volcengine-ark-video", "doubao-seedance-2-0-260128")
+	if profile == nil || profile.Video == nil {
+		t.Fatal("Volcengine Ark video profile = nil")
+	}
+	for _, operation := range []string{"reference_to_video", "audio_to_video"} {
+		if !containsCapabilityString(profile.Video.Operations, operation) {
+			t.Fatalf("operations = %v, want %s", profile.Video.Operations, operation)
+		}
+	}
+	if profile.Video.References.MaxImages != 9 || profile.Video.References.MaxVideos != 3 || profile.Video.References.MaxAudios != 3 {
+		t.Fatalf("reference limits = %#v", profile.Video.References)
+	}
+}
+
+func TestValidateVolcengineArkFullModalReferenceRejectsTextAndAudioOnly(t *testing.T) {
+	profile := DefaultModelCapabilityConfigForModel("volcengine-ark-video", "doubao-seedance-2-0-260128").Video
+	input := canvasGenerationInput{
+		Prompt:          "follow the soundtrack",
+		Config:          providerConfig{InterfaceType: "volcengine-ark-video", VideoSeconds: "6", Size: "16:9", VQuality: "720p"},
+		ReferenceAudios: []providerMedia{{URL: "https://example.com/music.mp3"}},
+		Metadata:        map[string]interface{}{"videoEditOperation": "audio_to_video"},
+	}
+	err := validateVideoTask(profile, input)
+	if err == nil || !strings.Contains(err.Error(), "文本+音频") {
+		t.Fatalf("validateVideoTask() error = %v", err)
+	}
+
+	input.ReferenceImages = []providerMedia{{URL: "https://example.com/subject.png"}}
+	if err := validateVideoTask(profile, input); err != nil {
+		t.Fatalf("validateVideoTask(full modal) error = %v", err)
+	}
+}
+
 func TestCapabilitySpecFromModelCapabilityConfigRestoresLegacyWildcardImageSizes(t *testing.T) {
 	config := &ModelCapabilityConfig{
 		Version: 1,

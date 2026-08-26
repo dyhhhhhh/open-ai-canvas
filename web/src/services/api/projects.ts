@@ -56,8 +56,24 @@ export type ProjectAsset = {
     primaryVersionId?: string;
     versionCount: number;
     usages: string[];
+    folderId?: string;
+    position: number;
+    storageKey?: string;
+    previewText?: string;
     updatedAt: string;
     character?: CharacterCardSummary;
+};
+
+export type ProjectAssetFolder = {
+    id: string;
+    projectId: string;
+    parentId?: string;
+    name: string;
+    style: "glass" | "stacked" | "midnight" | "paper" | "cinema" | "compact" | string;
+    theme: "aurora" | "obsidian" | "ember" | "pearl" | string;
+    position: number;
+    createdAt: string;
+    updatedAt: string;
 };
 
 export type CharacterRepresentation = {
@@ -154,20 +170,31 @@ export type ProjectSummary = {
     completedUnitCount: number;
 };
 
+export type ProjectListPage = {
+    projects: ProjectSummary[];
+    page: number;
+    pageSize: number;
+    total: number;
+    hasMore: boolean;
+};
+
 export type ProjectDetail = {
     project: Project;
     units: ProjectUnit[];
     canvases: ProjectCanvas[];
     canvasUnitLinks: CanvasUnitLink[];
     assets: ProjectAsset[];
+    assetFolders: ProjectAssetFolder[];
     workflows: ProjectWorkflow[];
     shots: ProjectShot[];
     shotReferences: ShotAssetReference[];
     assetCandidates: ProjectAssetCandidate[];
 };
 
-export function listProjects() {
-    return request<{ projects: ProjectSummary[] }>(api.get("/projects"));
+export function listProjects(): Promise<{ projects: ProjectSummary[] }>;
+export function listProjects(params: { page: number; pageSize: number }): Promise<ProjectListPage>;
+export function listProjects(params?: { page: number; pageSize: number }) {
+    return request<{ projects: ProjectSummary[] } | ProjectListPage>(api.get("/projects", params ? { params: { page: params.page, page_size: params.pageSize } } : undefined));
 }
 
 export function getProject(id: string) {
@@ -222,7 +249,7 @@ export function unlinkCanvasProject(projectId: string, canvasId: string) {
     return request<{ canvasId: string }>(api.delete(`/projects/${encodeURIComponent(projectId)}/canvases/${encodeURIComponent(canvasId)}`));
 }
 
-export function linkProjectAsset(projectId: string, input: { assetId: string; category: string }, signal?: AbortSignal) {
+export function linkProjectAsset(projectId: string, input: { assetId: string; category: string; folderId?: string }, signal?: AbortSignal) {
     return request<{ asset: ProjectAsset }>(api.post(`/projects/${encodeURIComponent(projectId)}/assets`, input, { signal }));
 }
 
@@ -232,6 +259,26 @@ export function unlinkProjectAsset(projectId: string, assetId: string) {
 
 export function updateProjectAssetCategory(projectId: string, assetId: string, category: string, signal?: AbortSignal) {
     return request<{ asset: ProjectAsset }>(api.patch(`/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, { category }, { signal }));
+}
+
+export function moveProjectAsset(projectId: string, assetId: string, folderId: string, signal?: AbortSignal) {
+    return request<{ asset: ProjectAsset }>(api.patch(`/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, { folderId }, { signal }));
+}
+
+export function listProjectAssetFolders(projectId: string, signal?: AbortSignal) {
+    return request<{ folders: ProjectAssetFolder[] }>(api.get(`/projects/${encodeURIComponent(projectId)}/asset-folders`, { signal }));
+}
+
+export function createProjectAssetFolder(projectId: string, input: { name: string; parentId?: string; style?: ProjectAssetFolder["style"]; theme?: ProjectAssetFolder["theme"] }) {
+    return request<{ folder: ProjectAssetFolder }>(api.post(`/projects/${encodeURIComponent(projectId)}/asset-folders`, input));
+}
+
+export function updateProjectAssetFolder(projectId: string, folderId: string, input: { name?: string; parentId?: string; style?: ProjectAssetFolder["style"]; theme?: ProjectAssetFolder["theme"] }) {
+    return request<{ folder: ProjectAssetFolder }>(api.patch(`/projects/${encodeURIComponent(projectId)}/asset-folders/${encodeURIComponent(folderId)}`, input));
+}
+
+export function deleteProjectAssetFolder(projectId: string, folderId: string) {
+    return request<{ id: string }>(api.delete(`/projects/${encodeURIComponent(projectId)}/asset-folders/${encodeURIComponent(folderId)}`));
 }
 
 export function createProjectAssetVersion(projectId: string, assetId: string, input: { prompt?: string; definitionJson?: string; note?: string }) {

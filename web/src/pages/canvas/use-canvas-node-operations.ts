@@ -3,11 +3,12 @@ import { App } from "antd";
 import copyToClipboard from "copy-to-clipboard";
 import { nanoid } from "nanoid";
 
-import { FRAME_HEADER_HEIGHT, getFrameChildIds, getFrameChildren, isFrameNode } from "@/lib/canvas/canvas-frame";
+import { NODE_DEFAULT_SIZE } from "@/constant/canvas";
+import { FOLDER_COLLAPSED_HEIGHT, FOLDER_COLLAPSED_WIDTH, FRAME_HEADER_HEIGHT, getFrameChildIds, getFrameChildren, isFrameNode } from "@/lib/canvas/canvas-frame";
 import { alignCanvasNodes, layoutCanvasFlow, layoutCanvasNodes, nextCanvasVersionLabel, type CanvasAlignmentMode } from "@/lib/canvas/canvas-layout";
-import { createCanvasNode, removeCanvasNodes } from "@/lib/canvas/canvas-project-domain";
+import { createCanvasNode, isHiddenBatchChild, removeCanvasNodes } from "@/lib/canvas/canvas-project-domain";
 import { isolateCopiedNodeMetadata } from "@/lib/canvas/canvas-node-copy";
-import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type ContextMenuState, type Position } from "@/types/canvas";
+import { CanvasNodeType, type CanvasConnection, type CanvasFolderStyle, type CanvasFolderTheme, type CanvasNodeData, type ContextMenuState, type Position } from "@/types/canvas";
 import { cloneCanvasDrawing } from "@/lib/canvas/canvas-drawing-storage";
 import { isDrawingEngineAvailable, type CanvasDrawingEngine } from "@/lib/canvas/canvas-drawing-engine";
 import { useUserStore } from "@/stores/use-user-store";
@@ -132,12 +133,57 @@ export function useCanvasNodeOperations({
         if (type !== CanvasNodeType.Text && type !== CanvasNodeType.Script && type !== CanvasNodeType.Audio && type !== CanvasNodeType.Frame && type !== CanvasNodeType.Drawing) setDialogNodeId(node.id);
     }, [commitNodes, defaultDrawingEngine, getCanvasCenter, message, nodesRef, selectNodes, setDialogNodeId, tldrawLicenseKey]);
 
+    const createFolder = useCallback((position?: Position, linked?: { id: string; projectId: string; title: string; style: CanvasFolderStyle; theme: CanvasFolderTheme; createdAt: string }) => {
+        const folder = createCanvasNode(CanvasNodeType.Frame, position || getCanvasCenter(), {
+            frame: {
+                collapsed: true,
+                expandedWidth: NODE_DEFAULT_SIZE[CanvasNodeType.Frame].width,
+                expandedHeight: NODE_DEFAULT_SIZE[CanvasNodeType.Frame].height,
+            },
+            folder: {
+                style: linked?.style || "glass",
+                theme: linked?.theme || "aurora",
+                createdAt: linked?.createdAt || new Date().toISOString(),
+                assetFolderId: linked?.id,
+                projectId: linked?.projectId,
+            },
+        });
+        folder.title = linked?.title || "我的文件";
+        folder.width = FOLDER_COLLAPSED_WIDTH;
+        folder.height = FOLDER_COLLAPSED_HEIGHT;
+        commitNodes([...nodesRef.current, folder]);
+        selectNodes(new Set([folder.id]));
+        message.success(linked ? "素材文件夹已放到画布，打开可浏览其中内容" : "文件夹已创建，可拖入任意非容器节点");
+    }, [commitNodes, getCanvasCenter, message, nodesRef, selectNodes]);
+
     const arrangeSelectedNodes = useCallback((mode: "row" | "column" | "grid" | "flow") => {
         const selected = nodesRef.current.filter((node) => selectedNodeIdsRef.current.has(node.id) && !node.metadata?.locked && !isFrameNode(node));
         if (selected.length < 2) return;
         const positions = mode === "flow" ? layoutCanvasFlow(selected, connectionsRef.current) : layoutCanvasNodes(selected, mode);
         commitNodes(nodesRef.current.map((node) => positions.has(node.id) ? { ...node, position: positions.get(node.id)! } : node));
         message.success(mode === "flow" ? "已按连线整理" : "已整理选中节点");
+    }, [commitNodes, connectionsRef, message, nodesRef, selectedNodeIdsRef]);
+
+    const autoArrangeCanvasNodes = useCallback(() => {
+        const currentNodes = nodesRef.current;
+        const selectedIds = selectedNodeIdsRef.current;
+        const hasSelection = selectedIds.size > 0;
+        const candidates = currentNodes.filter((node) => {
+            if (node.metadata?.locked || isFrameNode(node) || isHiddenBatchChild(node, currentNodes)) return false;
+            if (hasSelection) return selectedIds.has(node.id);
+            return !node.parentId;
+        });
+        if (candidates.length < 2) {
+            message.info(hasSelection ? "请至少选择两个可整理节点" : "画布中至少需要两个可整理节点");
+            return;
+        }
+
+        const candidateIds = new Set(candidates.map((node) => node.id));
+        const hasConnections = connectionsRef.current.some((connection) => candidateIds.has(connection.fromNodeId) && candidateIds.has(connection.toNodeId));
+        const mode = hasConnections ? "flow" : "grid";
+        const positions = mode === "flow" ? layoutCanvasFlow(candidates, connectionsRef.current) : layoutCanvasNodes(candidates, "grid");
+        commitNodes(currentNodes.map((node) => positions.has(node.id) ? { ...node, position: positions.get(node.id)! } : node));
+        message.success(mode === "flow" ? (hasSelection ? "已按连线整理选中节点" : "已按连线整理画布") : (hasSelection ? "已网格整理选中节点" : "已网格整理画布"));
     }, [commitNodes, connectionsRef, message, nodesRef, selectedNodeIdsRef]);
 
     const alignSelectedNodes = useCallback((mode: CanvasAlignmentMode) => {
@@ -461,9 +507,11 @@ export function useCanvasNodeOperations({
 
     return {
         alignSelectedNodes,
+        autoArrangeCanvasNodes,
         arrangeSelectedNodes,
         copyNodesToClipboard,
         copySelectedNodes,
+        createFolder,
         createNode,
         createReferenceGroup,
         createStoryboardGroup,

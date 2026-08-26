@@ -23,6 +23,7 @@ const RedemptionCodesPage = lazy(() => import("@/pages/admin/redemption-codes/re
 const RuntimePolicySettingsPage = lazy(() => import("@/pages/admin/settings/runtime-policy-settings-page"));
 const DrawingEngineSettingsPage = lazy(() => import("@/pages/admin/settings/drawing-engine-settings-page"));
 const StorageSettingsPage = lazy(() => import("@/pages/admin/settings/storage-settings-page"));
+const ArkPrivateAssetsSettingsPage = lazy(() => import("@/pages/admin/settings/ark-private-assets-settings-page"));
 const ResponseInterceptionSettingsPage = lazy(() => import("@/pages/admin/settings/response-interception-settings-page"));
 const ThirdPartySettingsPage = lazy(() => import("@/pages/admin/settings/libtv-settings-page"));
 const StoryboardPromptsPage = lazy(() => import("@/pages/admin/storyboard-prompts/storyboard-prompts-page"));
@@ -37,12 +38,15 @@ const CreatePage = lazy(loadCreatePage);
 const HomePage = lazy(() => import("@/pages/home"));
 const NotFound = lazy(() => import("@/pages/not-found"));
 const SkillsPage = lazy(() => import("@/pages/skills"));
+const PluginsPage = lazy(() => import("@/pages/plugins"));
+const EagleLibraryPage = lazy(() => import("@/pages/plugins/eagle"));
 const TasksPage = lazy(() => import("@/pages/tasks"));
 const WalletPage = lazy(loadWalletPage);
 const ProjectsPage = lazy(loadProjectsPage);
 const ProjectDetailPage = lazy(() => import("@/pages/projects/detail"));
 const SettingsPage = lazy(() => import("@/pages/settings"));
 const TestVoiceRecording = lazy(() => import("@/pages/test-voice-recording"));
+const FolderPreviewLab = lazy(() => import("@/pages/dev/folder-preview-lab"));
 
 function deferred(element: ReactNode) {
     return <Suspense fallback={<WorkspaceRouteLoader />}>{element}</Suspense>;
@@ -62,6 +66,9 @@ export const router = createBrowserRouter([
         ],
     },
     { path: "/share/canvas/:token", element: fullScreenDeferred(<SharedCanvasPage />), errorElement: <RouteErrorPage /> },
+    ...(import.meta.env.DEV
+        ? [{ path: "/dev/folders", element: fullScreenDeferred(<FolderPreviewLab />), errorElement: <RouteErrorPage /> }]
+        : []),
     {
         element: (
             <UserLayout>
@@ -83,6 +90,8 @@ export const router = createBrowserRouter([
             },
             { path: "/assets", element: <RequireAuth>{deferred(<AssetsPage />)}</RequireAuth> },
             { path: "/skills", element: <RequireAuth>{deferred(<SkillsPage />)}</RequireAuth> },
+            { path: "/plugins", element: <RequireAuth><RequireFeature feature="pluginCenterEnabled">{deferred(<PluginsPage />)}</RequireFeature></RequireAuth> },
+            { path: "/plugins/eagle", element: <RequireAuth><RequireFeature feature="pluginCenterEnabled">{deferred(<EagleLibraryPage />)}</RequireFeature></RequireAuth> },
             {
                 path: "/wallet",
                 element: (
@@ -134,7 +143,7 @@ export const router = createBrowserRouter([
                     { index: true, element: deferred(<AnalyticsPage />) },
                     { path: "users", element: deferred(<UsersPage />) },
                     { path: "channels", element: deferred(<ChannelsPage />) },
-                    { path: "models", element: deferred(<LogicalModelsPage />) },
+                    { path: "models", element: <RequireFeature feature="frontendModelsEnabled">{deferred(<LogicalModelsPage />)}</RequireFeature> },
                     { path: "prompt-templates", element: deferred(<StoryboardPromptsPage />) },
                     { path: "storyboard-prompts", element: <Navigate to="/admin/prompt-templates" replace /> },
                     { path: "announcements", element: deferred(<AnnouncementsPage />) },
@@ -149,6 +158,7 @@ export const router = createBrowserRouter([
                     { path: "settings/access", element: deferred(<AccessSettingsPage />) },
                     { path: "settings/email", element: deferred(<EmailSettingsPage />) },
                     { path: "settings/storage", element: deferred(<StorageSettingsPage />) },
+                    { path: "settings/ark-private-assets", element: deferred(<ArkPrivateAssetsSettingsPage />) },
                     { path: "settings/response-interception", element: deferred(<ResponseInterceptionSettingsPage />) },
                     { path: "settings/third-party", element: deferred(<ThirdPartySettingsPage />) },
                     { path: "settings/libtv", element: <Navigate to="/admin/settings/third-party" replace /> },

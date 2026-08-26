@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
-import { Image as ImageIcon, LoaderCircle, MessageSquare, Music2, Play, Settings2, Square, Video } from "lucide-react";
-import { Button, Segmented, Select } from "antd";
+import { Image as ImageIcon, LoaderCircle, MessageSquare, Music2, Play, Settings2, Video } from "lucide-react";
+import { Button, InputNumber, Segmented, Select } from "antd";
 
 import { ModelPicker } from "@/components/model-picker";
 import { configuredModelMatchesCapability, defaultConfig, modelOptionName, resolveModelChannel, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
@@ -23,7 +23,6 @@ type CanvasConfigNodePanelProps = {
     inputSummary: { textCount: number; imageCount: number; videoCount: number; audioCount: number; characterCount: number };
     onConfigChange: (nodeId: string, patch: Partial<CanvasNodeMetadata>) => void;
     onGenerate: (nodeId: string) => void;
-    onStop: (nodeId: string) => void;
     onComposerToggle: () => void;
     workspaceMode?: CanvasWorkspaceMode;
 };
@@ -31,6 +30,7 @@ type CanvasConfigNodePanelProps = {
 const videoOperationOptions: Array<{ label: string; value: CanvasVideoEditOperation }> = [
     { label: "文生视频", value: "text_to_video" },
     { label: "图生视频", value: "image_to_video" },
+    { label: "全模态参考", value: "reference_to_video" },
     { label: "视频续写", value: "extend" },
     { label: "局部修改", value: "inpaint" },
     { label: "元素替换", value: "replace_element" },
@@ -40,7 +40,7 @@ const videoOperationOptions: Array<{ label: string; value: CanvasVideoEditOperat
     { label: "版本对比", value: "compare_versions" },
 ];
 
-export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigChange, onGenerate, onStop, onComposerToggle, workspaceMode = "professional" }: CanvasConfigNodePanelProps) {
+export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigChange, onGenerate, onComposerToggle, workspaceMode = "professional" }: CanvasConfigNodePanelProps) {
     const globalConfig = useEffectiveConfig();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const creditsEnabled = useUserStore((state) => state.features.creditsEnabled);
@@ -69,6 +69,7 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
     const videoProfile = mode === "video" ? modelCapabilityConfigFor(config, config.model).video! : undefined;
     const operationOptions = videoProfile ? videoOperationOptions.filter((item) => videoProfile.operations.includes(item.value) || item.value === "concat") : videoOperationOptions;
     const count = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
+    const textCountValue = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(node.metadata?.textCount) || 1))));
     const priceChannel = resolveModelChannel(config, config.model);
     const credits = requestCreditCost({ channelMode: priceChannel.scope === "system" ? "remote" : "local", modelCosts: priceChannel.modelCosts, model: modelOptionName(config.model), count: mode === "image" ? count : 1, seconds: mode === "video" ? config.videoSeconds : 1 });
     const hasPrice = creditsEnabled && credits !== null;
@@ -165,9 +166,14 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
             {simpleMode ? (
                 <div className="mb-2 rounded-lg px-2 py-2 text-[var(--fs-label)]" style={{ background: theme.node.fill, color: theme.node.muted }}>将使用当前默认模型与生成参数</div>
             ) : (
-                <div className={`mb-2 grid min-w-0 cursor-default items-center gap-2 ${mode === "image" || mode === "video" || mode === "audio" ? "grid-cols-[minmax(0,1fr)_148px]" : "grid-cols-1"}`} onMouseDown={(event) => event.stopPropagation()}>
+                <div className={`mb-2 grid min-w-0 cursor-default items-center gap-2 ${mode === "image" || mode === "video" || mode === "audio" || mode === "text" ? "grid-cols-[minmax(0,1fr)_148px]" : "grid-cols-1"}`} onMouseDown={(event) => event.stopPropagation()}>
                     <ModelPicker className="canvas-compact-control h-10" config={config} value={config.model} onChange={(model) => onConfigChange(node.id, mode === "image" ? { model, ...defaultImageParamsForModel(config, model) } : { model })} capability={mode} requirements={requirements} onMissingConfig={() => navigateToSettings({ continueCreation: true })} fullWidth showSelectedPrice={creditsEnabled} />
-                    {mode === "video" ? (
+                    {mode === "text" ? (
+                        <div className="flex h-10 min-w-0 cursor-default items-center justify-between gap-2 rounded-lg border px-2.5" style={{ borderColor: theme.node.stroke, background: theme.node.fill }} data-canvas-no-zoom onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
+                            <span className="inline-flex items-center gap-1 text-[var(--fs-tiny)] font-semibold" style={{ color: theme.node.muted }}><MessageSquare className="size-3.5" />文本份数</span>
+                            <InputNumber size="small" min={1} max={15} value={textCountValue} onChange={(value) => onConfigChange(node.id, { textCount: Math.max(1, Math.min(15, Math.floor(Math.abs(Number(value)) || 1))) })} aria-label="文本生成份数" />
+                        </div>
+                    ) : mode === "video" ? (
                         <CanvasVideoSettingsPopover config={config} placement="topRight" buttonClassName="canvas-compact-control !h-10 !w-full !justify-start !rounded-lg !px-2" onConfigChange={(key, value) => onConfigChange(node.id, videoConfigPatch(key, value))} />
                     ) : mode === "image" ? (
                         <CanvasImageSettingsPopover config={config} placement="topRight" autoAdjustOverflow={false} buttonClassName="canvas-compact-control !h-10 !w-full !justify-start !rounded-lg !px-2" onConfigChange={(key, value) => onConfigChange(node.id, key === "count" ? { count: Number(value) || 1 } : { [key]: value })} />
@@ -182,17 +188,15 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
             <Button
                 type="primary"
                 className="mt-auto !h-9 !w-full !cursor-pointer !rounded-lg"
-                danger={isRunning}
-                disabled={!isRunning && !canGenerate}
+                disabled={isRunning || !canGenerate}
                 onMouseDown={(event) => event.stopPropagation()}
-                onClick={() => (isRunning ? onStop(node.id) : onGenerate(node.id))}
+                onClick={() => onGenerate(node.id)}
             >
                 <span className="inline-flex items-center gap-1.5">
                     {isRunning ? (
                         <>
                             <LoaderCircle className="size-4 animate-spin" />
-                            <Square className="size-3.5 fill-current" />
-                            <span>停止</span>
+                            <span>生成中</span>
                         </>
                     ) : (
                         <>
@@ -293,6 +297,7 @@ function videoConfigPatch(key: keyof AiConfig, value: string) {
     if (key === "videoSeconds") return { seconds: value };
     if (key === "videoGenerateAudio") return { generateAudio: value };
     if (key === "videoWatermark") return { watermark: value };
+    if (key === "videoArkPrivateAssetUpload") return { arkPrivateAssetUpload: value };
     return { [key]: value };
 }
 

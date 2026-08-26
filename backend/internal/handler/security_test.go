@@ -36,6 +36,7 @@ func TestAuthorizeCustomRelayAllowsModelsAndAgentEndpoints(t *testing.T) {
 		{method: http.MethodGet, target: "https://api.example.com/v1/models", apiFormat: "openai"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/responses", apiFormat: "openai", contentType: "application/json"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/chat/completions", apiFormat: "openai", contentType: "application/json; charset=utf-8"},
+		{method: http.MethodPost, target: "https://api.anthropic.com/v1/messages", apiFormat: "claude", contentType: "application/json"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/audio/speech", apiFormat: "openai", contentType: "application/json"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/images/edits", apiFormat: "openai", contentType: "multipart/form-data; boundary=test"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/images/edits", apiFormat: "openai", contentType: "application/json"},
@@ -77,6 +78,8 @@ func TestAuthorizeCustomRelayRejectsArbitraryRequestsAndCredentialQueries(t *tes
 		{method: http.MethodGet, target: "https://api.example.com/account", apiFormat: "openai"},
 		{method: http.MethodGet, target: "https://api.example.com/v1/models?api_key=secret", apiFormat: "openai"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/responses", apiFormat: "openai", contentType: "text/plain"},
+		{method: http.MethodPost, target: "https://api.anthropic.com/v1/messages", apiFormat: "claude", contentType: "text/plain"},
+		{method: http.MethodGet, target: "https://api.anthropic.com/v1/messages", apiFormat: "claude"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/account", apiFormat: "openai", contentType: "multipart/form-data; boundary=test"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/../account/chat/completions", apiFormat: "openai", contentType: "application/json"},
 		{method: http.MethodPost, target: "https://api.example.com/v1/models/gemini:streamGenerateContent?alt=sse&token=secret", apiFormat: "gemini", contentType: "application/json"},
@@ -122,6 +125,26 @@ func TestAuthorizeSystemProxyRestrictsModelProtocol(t *testing.T) {
 	}
 	if err := authorizeSystemProxy(channel, model.ChannelInterfaceChatCompletion, http.MethodPost, "/responses", "application/json", body); err == nil {
 		t.Fatal("authorizeSystemProxy() error = nil for mismatched interface")
+	}
+}
+
+func TestAuthorizeSystemProxyMiniMaxVideoCreateAndPoll(t *testing.T) {
+	channel := &model.ModelChannel{APIFormat: "openai", ModelsJSON: `["MiniMax-H3"]`}
+	createBody := []byte(`{"model":"MiniMax-H3","content":[{"type":"text","text":"test"}]}`)
+	if err := authorizeSystemProxy(channel, model.ChannelInterfaceMiniMaxVideo, http.MethodPost, "/v2/video_generation", "application/json", createBody); err != nil {
+		t.Fatalf("MiniMax create should be allowed: %v", err)
+	}
+	if err := authorizeSystemProxy(channel, model.ChannelInterfaceMiniMaxVideo, http.MethodGet, "/v2/query/video_generation/task-1", "", nil); err != nil {
+		t.Fatalf("MiniMax poll should be allowed: %v", err)
+	}
+	if err := authorizeSystemProxy(channel, model.ChannelInterfaceMiniMaxVideo, http.MethodGet, "/v2/account", "", nil); err == nil {
+		t.Fatal("arbitrary MiniMax GET should be rejected")
+	}
+	if err := authorizeSystemProxy(channel, model.ChannelInterfaceMiniMaxVideo, http.MethodPost, "/v2/video_generation", "text/plain", createBody); err == nil {
+		t.Fatal("MiniMax non-JSON create should be rejected")
+	}
+	if err := authorizeSystemProxy(channel, model.ChannelInterfaceMiniMaxVideo, http.MethodPost, "/v2/video_generation", "application/json", []byte(`{"model":"unapproved"}`)); err == nil {
+		t.Fatal("unapproved MiniMax model should be rejected")
 	}
 }
 

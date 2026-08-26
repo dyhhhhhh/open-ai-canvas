@@ -1,15 +1,16 @@
 import { useEffect, useState } from "react";
-import { App, Button, Drawer, Form, Input, InputNumber, Popconfirm, Segmented, Select, Space, Switch } from "antd";
+import { App, Button, Drawer, Form, Input, InputNumber, Popconfirm, Segmented, Select, Space, Switch, type FormInstance } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { FlaskConical, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import { FlaskConical, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 
 import { PaginationBar } from "@/components/layout/workspace-page";
 import { ModelIcon } from "@/components/model-picker";
 import { ModelCapabilityEditor } from "@/components/model-capability-editor";
 import { CapabilityCardPicker, ProtocolCardPicker, type ModelCapabilityChoice } from "@/components/model-protocol-picker";
 import { defaultModelCapabilityConfig, normalizeModelCapabilityConfig, type ModelCapabilityConfig } from "@/lib/model-capabilities";
-import { MODEL_PROTOCOLS, modelProtocolCapability, modelProtocolDefinition, modelProtocolLabel, modelProtocolSupportsTokenBilling, type ModelProtocol } from "@/lib/model-protocols";
-import { createAdminChannelModel, deleteAdminChannelModel, fetchAdminChannelModels, listAdminChannelModels, testAdminChannelModel, updateAdminChannelModel, type ChannelModel } from "@/services/api/wallet";
+import { modelProtocolCapability, modelProtocolDefinition, modelProtocolLabel, modelProtocolSupportsTokenBilling, type ModelProtocol } from "@/lib/model-protocols";
+import { fetchProtocolCatalog } from "@/services/api/protocols";
+import { createAdminChannelModel, deleteAdminChannelModel, fetchAdminChannelModels, listAdminChannelModels, testAdminChannelModel, updateAdminChannelModel, type ChannelModel, type ChannelModelPriceTier } from "@/services/api/wallet";
 import type { ModelChannel } from "@/stores/use-config-store";
 import { AdminPageFrame } from "./admin-shell";
 import { AdminDataTable, AdminFilterChip, AdminStatusBadge } from "./admin-ui";
@@ -18,16 +19,30 @@ type EditableCapability = ModelCapabilityChoice;
 
 type FormValues = {
     modelKey: string;
+    providerModelKey?: string;
     displayName?: string;
     capability: EditableCapability;
-    protocol: ModelProtocol;
+    protocol?: ModelProtocol;
+	priceTiers: PriceTierFormValues[];
+    enabled: boolean;
+    capabilityConfig?: ModelCapabilityConfig;
+};
+
+type PriceTierFormValues = {
+	operation: string;
+	quality: string;
+	size: string;
+	resolution: string;
+	videoSeconds: number;
+	imageCount: number;
+    providerModelKey?: string;
     billingMode: ChannelModel["billingMode"];
     unitPrice: number;
     inputTokenPrice: number;
     outputTokenPrice: number;
     cachedTokenPrice: number;
+    priceConfigured: boolean;
     enabled: boolean;
-    capabilityConfig?: ModelCapabilityConfig;
 };
 
 export function ChannelModelManager({ channel, onClose, onChanged }: { channel: ModelChannel; onClose: () => void; onChanged: () => void | Promise<void> }) {
@@ -44,11 +59,13 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
     const [status, setStatus] = useState<"all" | "enabled" | "disabled">("all");
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(20);
+    const [availableProtocols, setAvailableProtocols] = useState<import("@/lib/model-protocols").ModelProtocolDefinition[]>([]);
     const [form] = Form.useForm<FormValues>();
-    const billingMode = Form.useWatch("billingMode", form) || "fixed_request";
     const modelCapability = Form.useWatch("capability", form);
     const modelProtocol = Form.useWatch("protocol", form);
     const modelKey = Form.useWatch("modelKey", form) || "";
+    const providerModelKey = Form.useWatch("providerModelKey", form) || "";
+	const capabilityConfig = Form.useWatch("capabilityConfig", form);
 
     const reload = async () => {
         if (!channel) return;
@@ -64,6 +81,7 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
 
     useEffect(() => {
         void reload();
+        void fetchProtocolCatalog("admin.system-channel").then(setAvailableProtocols).catch(() => setAvailableProtocols([]));
         setEditing(null);
         setEditorOpen(false);
         setKeyword("");
@@ -93,16 +111,13 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
         setEditing(null);
         form.setFieldsValue({
             modelKey: "",
+            providerModelKey: "",
             displayName: "",
             capability: "text",
-            protocol: "chat-completion",
-            billingMode: "fixed_request",
-            unitPrice: 0,
-            inputTokenPrice: 0,
-            outputTokenPrice: 0,
-            cachedTokenPrice: 0,
+            protocol: availableProtocols.find((item) => item.capability === "text")?.value,
+			priceTiers: [defaultPriceTier()],
             enabled: true,
-            capabilityConfig: defaultModelCapabilityConfig("chat-completion", ""),
+            capabilityConfig: defaultModelCapabilityConfig(availableProtocols.find((item) => item.capability === "text")?.value, ""),
         });
         setEditorOpen(true);
     };
@@ -111,37 +126,48 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
         setEditing(item);
         form.setFieldsValue({
             modelKey: item.modelKey,
+            providerModelKey: item.providerModelKey || item.modelKey,
             displayName: item.displayName,
             capability: item.capability || undefined,
             protocol: item.protocol,
-            billingMode: item.billingMode,
-            unitPrice: item.unitPriceMicrocredits / 1_000_000,
-            inputTokenPrice: item.inputTokenPriceMicrocredits / 1_000_000,
-            outputTokenPrice: item.outputTokenPriceMicrocredits / 1_000_000,
-            cachedTokenPrice: item.cachedTokenPriceMicrocredits / 1_000_000,
+			priceTiers: item.priceTiers?.length ? item.priceTiers.map(priceTierToForm) : [legacyPriceTierToForm(item)],
             enabled: item.enabled,
-            capabilityConfig: item.capability === "text" || item.capability === "image" || item.capability === "video" ? normalizeModelCapabilityConfig(item.capabilityConfig || defaultModelCapabilityConfig(item.protocol, item.modelKey)) : undefined,
+            capabilityConfig: item.capability === "text" || item.capability === "image" || item.capability === "video"
+            ? normalizeModelCapabilityConfig(item.capabilityConfig || defaultModelCapabilityConfig(item.protocol, item.providerModelKey || item.modelKey))
+                : undefined,
         });
         setEditorOpen(true);
     };
 
     const save = async () => {
         const values = await form.validateFields();
+        const upstreamModel = values.providerModelKey?.trim() || values.modelKey.trim();
+        const capabilityConfig = values.capability === "text" || values.capability === "image" || values.capability === "video"
+            ? normalizeModelCapabilityConfig(values.capabilityConfig || defaultModelCapabilityConfig(values.protocol, upstreamModel))
+            : undefined;
         setSaving(true);
         try {
             const payload = {
                 modelKey: values.modelKey.trim(),
+                providerModelKey: upstreamModel,
                 displayName: values.displayName?.trim() || values.modelKey.trim(),
                 capability: values.capability,
                 protocol: values.protocol,
-                billingMode: values.billingMode,
-                unitPriceMicrocredits: Math.round(values.unitPrice * 1_000_000),
-                inputTokenPriceMicrocredits: Math.round((values.inputTokenPrice || 0) * 1_000_000),
-                outputTokenPriceMicrocredits: Math.round((values.outputTokenPrice || 0) * 1_000_000),
-                cachedTokenPriceMicrocredits: Math.round((values.cachedTokenPrice || 0) * 1_000_000),
-                priceConfigured: true,
+				priceTiers: values.priceTiers.map((tier) => ({
+					selector: skuSelectorFromForm(values.capability, tier),
+					resolution: values.capability === "video" ? (tier.resolution || "*") : "*",
+					videoSeconds: values.capability === "video" ? Number(tier.videoSeconds || 0) : 0,
+					providerModelKey: tier.providerModelKey?.trim() || upstreamModel,
+					billingMode: tier.billingMode,
+					unitPriceMicrocredits: Math.round((tier.unitPrice || 0) * 1_000_000),
+					inputTokenPriceMicrocredits: Math.round((tier.inputTokenPrice || 0) * 1_000_000),
+					outputTokenPriceMicrocredits: Math.round((tier.outputTokenPrice || 0) * 1_000_000),
+					cachedTokenPriceMicrocredits: Math.round((tier.cachedTokenPrice || 0) * 1_000_000),
+					priceConfigured: tier.priceConfigured !== false,
+					enabled: tier.enabled !== false,
+				})),
                 enabled: values.enabled !== false,
-                capabilityConfig: values.capability === "text" || values.capability === "image" || values.capability === "video" ? normalizeModelCapabilityConfig(values.capabilityConfig!) : undefined,
+                capabilityConfig,
             };
             if (editing) await updateAdminChannelModel(channel.id, editing.id, payload);
             else await createAdminChannelModel(channel.id, payload);
@@ -158,14 +184,19 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
     };
 
     const testModel = async () => {
-        const values = await form.validateFields(["modelKey", "capability", "protocol", ...(modelCapability === "text" || modelCapability === "image" || modelCapability === "video" ? ["capabilityConfig"] : [])]);
+        const values = await form.validateFields(["modelKey", "providerModelKey", "capability", "protocol", ...(modelCapability === "text" || modelCapability === "image" || modelCapability === "video" ? ["capabilityConfig"] : [])]);
+        const upstreamModel = values.providerModelKey?.trim() || values.modelKey.trim();
+        const capabilityConfig = values.capability === "text" || values.capability === "image" || values.capability === "video"
+            ? normalizeModelCapabilityConfig(values.capabilityConfig || defaultModelCapabilityConfig(values.protocol, upstreamModel))
+            : undefined;
         setTesting(true);
         try {
             const result = await testAdminChannelModel(channel.id, {
                 modelKey: values.modelKey.trim(),
+                providerModelKey: upstreamModel,
                 capability: values.capability,
                 protocol: values.protocol,
-                capabilityConfig: values.capabilityConfig ? normalizeModelCapabilityConfig(values.capabilityConfig) : undefined,
+                capabilityConfig,
             });
             message.success(`模型测试通过，耗时 ${(result.durationMs / 1000).toFixed(2)} 秒`);
         } catch (error) {
@@ -190,19 +221,24 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
         if (changed.protocol && (modelCapability === "image" || modelCapability === "video")) {
             form.setFieldValue("capabilityConfig", defaultModelCapabilityConfig(changed.protocol, form.getFieldValue("modelKey")));
         }
-        const currentBillingMode = form.getFieldValue("billingMode") as ChannelModel["billingMode"] | undefined;
-        const currentCapability = form.getFieldValue("capability") as EditableCapability | undefined;
-        const currentProtocol = form.getFieldValue("protocol") as ModelProtocol | undefined;
-        if ((currentBillingMode === "per_second" && currentCapability !== "video") || (currentBillingMode === "token" && !modelProtocolSupportsTokenBilling(currentCapability, currentProtocol))) {
-            form.setFieldValue("billingMode", "fixed_request");
-        }
         if (!changed.capability) return;
         const current = form.getFieldValue("protocol") as ModelProtocol | undefined;
-        if (modelProtocolCapability(current) !== changed.capability) {
-            const nextProtocol = MODEL_PROTOCOLS.find((item) => item.capability === changed.capability)?.value;
+        if (modelProtocolCapability(current, availableProtocols) !== changed.capability) {
+            const nextProtocol = availableProtocols.find((item) => item.capability === changed.capability)?.value;
             form.setFieldValue("protocol", nextProtocol);
             form.setFieldValue("capabilityConfig", changed.capability === "text" || changed.capability === "image" || changed.capability === "video" ? defaultModelCapabilityConfig(nextProtocol, form.getFieldValue("modelKey")) : undefined);
         }
+		const nextTiers = (form.getFieldValue("priceTiers") || []).map((tier: PriceTierFormValues) => ({
+			...tier,
+			operation: tier.operation || "*",
+			quality: changed.capability === "image" ? tier.quality || "*" : "*",
+			size: changed.capability === "image" ? tier.size || "*" : "*",
+						resolution: changed.capability === "video" ? tier.resolution || "*" : "*",
+						videoSeconds: changed.capability === "video" ? tier.videoSeconds || 0 : 0,
+						imageCount: changed.capability === "video" ? tier.imageCount || 0 : 0,
+			billingMode: tier.billingMode === "per_second" && changed.capability !== "video" ? "fixed_request" : tier.billingMode,
+		}));
+		form.setFieldValue("priceTiers", nextTiers);
     };
 
     const columns: ColumnsType<ChannelModel> = [
@@ -216,6 +252,7 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
                     <div className="min-w-0">
                         <div className="truncate font-medium">{item.displayName || item.modelKey}</div>
                         <div className="admin-monospace truncate text-xs text-foreground/45">{item.modelKey}</div>
+                        {item.providerModelKey && item.providerModelKey !== item.modelKey ? <div className="admin-monospace truncate text-xs text-foreground/35">上游：{item.providerModelKey}</div> : null}
                     </div>
                 </div>
             ),
@@ -228,14 +265,14 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
             render: (value: ModelProtocol) =>
                 value ? (
                     <div>
-                        <div className="text-xs font-medium">{modelProtocolLabel(value)}</div>
-                        <div className="truncate text-[var(--fs-tiny)] text-foreground/45">{modelProtocolDefinition(value)?.create}</div>
+                        <div className="text-xs font-medium">{modelProtocolLabel(value, availableProtocols)}</div>
+                        <div className="truncate text-[var(--fs-tiny)] text-foreground/45">{modelProtocolDefinition(value, availableProtocols)?.create}</div>
                     </div>
                 ) : (
                     <AdminStatusBadge label="待配置" tone="warning" />
                 ),
         },
-        { title: "计费", width: 220, render: (_, item) => (item.priceConfigured ? billingSummary(item) : <AdminStatusBadge label="未配置价格" tone="warning" />) },
+		{ title: "规格价格", width: 280, render: (_, item) => (item.priceConfigured ? billingSummary(item) : <AdminStatusBadge label="未配置价格" tone="warning" />) },
         { title: "版本", dataIndex: "priceVersion", width: 75, render: (value) => `v${value}` },
         { title: "状态", dataIndex: "enabled", width: 85, render: (enabled) => <AdminStatusBadge label={enabled ? "启用" : "停用"} tone={enabled ? "success" : "neutral"} /> },
         {
@@ -256,7 +293,7 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
 
     const filteredItems = items.filter((item) => {
         const query = keyword.trim().toLowerCase();
-        if (query && !`${item.modelKey} ${item.displayName}`.toLowerCase().includes(query)) return false;
+        if (query && !`${item.modelKey} ${item.providerModelKey} ${item.displayName}`.toLowerCase().includes(query)) return false;
         if (capability !== "all" && item.capability !== capability) return false;
         if (status === "enabled" && !item.enabled) return false;
         if (status === "disabled" && item.enabled) return false;
@@ -361,16 +398,19 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
                         <div className="mb-4">
                             <h2 className="text-sm font-semibold">模型身份</h2>
                         </div>
-                        <div className="grid gap-4 md:grid-cols-2">
-                            <Form.Item name="modelKey" label="模型标识" rules={[{ required: true, message: "请输入模型标识" }]}>
+                        <div className="grid gap-4 md:grid-cols-3">
+                            <Form.Item name="modelKey" label="产品模型标识" rules={[{ required: true, message: "请输入产品模型标识" }]}>
                                 <Input
                                     prefix={
                                         <span className="grid size-6 place-items-center">
                                             <ModelIcon model={modelKey} />
                                         </span>
                                     }
-                                    placeholder="例如：deepseek-chat、gpt-5、glm-4.5"
+                                    placeholder="例如：seedance-2-5"
                                 />
+                            </Form.Item>
+                            <Form.Item name="providerModelKey" label="上游模型 ID">
+                                <Input placeholder="留空则使用产品模型标识" />
                             </Form.Item>
                             <Form.Item name="displayName" label="后台显示名称">
                                 <Input placeholder="不填则使用模型标识" />
@@ -386,54 +426,41 @@ export function ChannelModelManager({ channel, onClose, onChanged }: { channel: 
                             <Form.Item className="mb-0" name="capability" label="模型能力" rules={[{ required: true }]}>
                                 <CapabilityCardPicker density="compact" />
                             </Form.Item>
-                            <Form.Item className="mb-0" name="protocol" label="请求协议" rules={[{ required: true, message: "请选择模型请求协议" }]}>
-                                <ProtocolCardPicker capability={modelCapability} density="compact" />
-                            </Form.Item>
+                            {availableProtocols.length ? <Form.Item className="mb-0" name="protocol" label="请求协议" rules={[{ required: true, message: "请选择模型请求协议" }]}>
+                                <ProtocolCardPicker capability={modelCapability} density="compact" protocols={availableProtocols} />
+                            </Form.Item> : null}
                         </div>
                         {modelCapability === "text" || modelCapability === "image" || modelCapability === "video" ? (
                             <Form.Item name="capabilityConfig" rules={[{ required: true, message: `请配置${capabilityLabel(modelCapability)}能力参数` }]}>
-                                <ModelCapabilityEditor capability={modelCapability} model={modelKey} protocol={form.getFieldValue("protocol")} />
+                                <ModelCapabilityEditor capability={modelCapability} model={providerModelKey || modelKey} protocol={form.getFieldValue("protocol")} />
                             </Form.Item>
                         ) : null}
                     </section>
 
                     <section className="admin-form-section">
                         <div className="mb-4">
-                            <h2 className="text-sm font-semibold">计费</h2>
+                            <h2 className="text-sm font-semibold">规格价格档</h2>
                         </div>
-                        <Form.Item name="billingMode" label="计费方式" rules={[{ required: true }]}>
-                            <Segmented
-                                block
-                                options={[
-                                    { label: "按次计费", value: "fixed_request" },
-                                    { label: "按秒计费", value: "per_second", disabled: modelCapability !== "video" },
-                                    { label: "Token 计费", value: "token", disabled: !modelProtocolSupportsTokenBilling(modelCapability, modelProtocol) },
-                                ]}
-                            />
-                        </Form.Item>
-                        {billingMode === "token" ? (
-                            modelCapability === "video" ? (
-                                <Form.Item name="outputTokenPrice" label="视频 / 百万 Token" rules={[{ required: true, message: "请输入视频 Token 价格" }]}>
-                                    <InputNumber style={{ width: "100%" }} min={0.000001} max={1_000_000} precision={6} step={0.1} />
-                                </Form.Item>
-                            ) : (
-                                <div className="grid gap-3 sm:grid-cols-3">
-                                    <Form.Item name="inputTokenPrice" label="输入 / 百万 Token" rules={[{ required: true, message: "请输入输入价格" }]}>
-                                        <InputNumber style={{ width: "100%" }} min={0} max={1_000_000} precision={6} step={0.1} />
-                                    </Form.Item>
-                                    <Form.Item name="outputTokenPrice" label="输出 / 百万 Token" rules={[{ required: true, message: "请输入输出价格" }]}>
-                                        <InputNumber style={{ width: "100%" }} min={0} max={1_000_000} precision={6} step={0.1} />
-                                    </Form.Item>
-                                    <Form.Item name="cachedTokenPrice" label="缓存 / 百万 Token" rules={[{ required: true, message: "请输入缓存价格" }]}>
-                                        <InputNumber style={{ width: "100%" }} min={0} max={1_000_000} precision={6} step={0.1} />
-                                    </Form.Item>
-                                </div>
-                            )
-                        ) : (
-                            <Form.Item name="unitPrice" label={billingMode === "per_second" ? "每秒消耗积分" : "每次消耗积分"} rules={[{ required: true, message: "请输入积分价格" }]}>
-                                <InputNumber style={{ width: "100%" }} min={0} max={1_000_000} precision={6} step={0.1} />
-                            </Form.Item>
-                        )}
+						<Form.List name="priceTiers" rules={[{ validator: async (_, value) => { if (!value?.length) throw new Error("请至少配置一个价格档"); } }]}>
+							{(fields, { add, remove }, { errors }) => (
+								<div className="space-y-2">
+									{fields.map((field, index) => (
+										<PriceTierFields
+											key={field.key}
+											index={field.name}
+											ordinal={index + 1}
+											form={form}
+											capability={modelCapability}
+											protocol={modelProtocol}
+											capabilityConfig={capabilityConfig}
+											onRemove={() => remove(field.name)}
+										/>
+									))}
+									<Button icon={<Plus className="size-4" />} onClick={() => add(defaultPriceTier())}>新增价格档</Button>
+									<Form.ErrorList errors={errors} />
+								</div>
+							)}
+						</Form.List>
                     </section>
 
                     <section className="admin-form-section">
@@ -454,23 +481,177 @@ function capabilityLabel(value: ChannelModel["capability"]) {
     return { text: "文本", image: "图片", video: "视频", audio: "音频", "": "待配置" }[value];
 }
 
-function billingSummary(item: ChannelModel) {
-    if (item.billingMode !== "token") {
-        return `${formatCredits(item.unitPriceMicrocredits)} 积分 / ${item.billingMode === "per_second" ? "秒" : "次"}`;
-    }
+function PriceTierFields({
+    index,
+    ordinal,
+    form,
+    capability,
+    protocol,
+    capabilityConfig,
+    onRemove,
+}: {
+    index: number;
+    ordinal: number;
+    form: FormInstance<FormValues>;
+    capability: EditableCapability | undefined;
+    protocol: ModelProtocol | undefined;
+    capabilityConfig?: ModelCapabilityConfig;
+    onRemove: () => void;
+}) {
+    const billingMode = Form.useWatch(["priceTiers", index, "billingMode"], form) || "fixed_request";
+    const video = capabilityConfig?.video;
+    const resolutionOptions = video?.resolutions || [];
+    const durationOptions = video?.duration.selection === "enum" ? video.duration.values || [] : [];
+	const tokenEnabled = Boolean(capability && protocol && modelProtocolSupportsTokenBilling(capability, protocol));
+	const isVideo = capability === "video";
+	const isImage = capability === "image";
+	const selectorColumnClass = isVideo || isImage ? "lg:col-span-3" : "lg:col-span-6";
+	const controlsColumnClass = billingMode === "token" && !isVideo ? "lg:col-span-3" : "lg:col-span-5";
     return (
-        <div className="text-xs leading-5">
-            {item.capability === "video" ? (
-                <div>视频 {formatCredits(item.outputTokenPriceMicrocredits)} / 百万</div>
-            ) : (
-                <>
-                    <div>输入 {formatCredits(item.inputTokenPriceMicrocredits)} / 百万</div>
-                    <div>输出 {formatCredits(item.outputTokenPriceMicrocredits)} / 百万</div>
-                    <div>缓存 {formatCredits(item.cachedTokenPriceMicrocredits)} / 百万</div>
-                </>
-            )}
+        <div className="rounded-md border border-border bg-muted/10 p-3">
+            <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="text-sm font-medium">价格档 {ordinal}</div>
+                <Button type="text" danger aria-label={`删除价格档 ${ordinal}`} title="删除价格档" icon={<X className="size-4" />} onClick={onRemove} />
+            </div>
+			<div className="grid gap-3 lg:grid-cols-12">
+				<Form.Item className={`mb-0 ${selectorColumnClass}`} name={[index, "operation"]} label="生成方式" rules={[{ required: true, message: "请选择生成方式" }]}>
+					<Select options={operationOptions(capability)} />
+				</Form.Item>
+                {isVideo ? (
+                    <Form.Item className="mb-0 lg:col-span-3" name={[index, "resolution"]} label="分辨率" rules={[{ required: true, message: "请选择分辨率" }]}>
+                        <Select options={[{ label: "任意分辨率", value: "*" }, ...resolutionOptions.map((value) => ({ label: value.toUpperCase(), value }))]} />
+                    </Form.Item>
+                ) : null}
+	                {isVideo ? (
+	                    <Form.Item className="mb-0 lg:col-span-3" name={[index, "videoSeconds"]} label="时长" rules={[{ required: true, message: "请输入时长" }]}>
+	                        {durationOptions.length ? <Select options={[{ label: "任意时长", value: 0 }, ...durationOptions.map((value) => ({ label: `${value} 秒`, value }))]} /> : <InputNumber className="w-full" min={0} precision={0} />}
+	                    </Form.Item>
+                ) : null}
+				{isVideo ? (
+					<Form.Item className="mb-0 lg:col-span-3" name={[index, "imageCount"]} label="参考图数量" rules={[{ required: true, message: "请输入参考图数量" }]}>
+						<InputNumber className="w-full" min={0} max={9} precision={0} placeholder="0 表示任意数量" />
+					</Form.Item>
+				) : null}
+				{isImage ? (
+					<Form.Item className="mb-0 lg:col-span-3" name={[index, "quality"]} label="质量/分辨率" rules={[{ required: true, message: "请选择质量或分辨率" }]}>
+						<Select options={[{ label: "任意质量", value: "*" }, { label: "1K", value: "1k" }, { label: "2K", value: "2k" }, { label: "4K", value: "4k" }]} />
+					</Form.Item>
+				) : null}
+				{isImage ? (
+					<Form.Item className="mb-0 lg:col-span-3" name={[index, "size"]} label="画幅/尺寸">
+						<Input placeholder="任意，或 1:1、16:9、1024x1024" />
+					</Form.Item>
+				) : null}
+                <Form.Item className={`mb-0 ${selectorColumnClass}`} name={[index, "providerModelKey"]} label="上游模型 ID">
+                    <Input placeholder="留空则使用模型默认上游 ID" />
+                </Form.Item>
+            </div>
+            <div className="grid items-end gap-3 lg:grid-cols-12">
+                <Form.Item className="mb-0 lg:col-span-4" name={[index, "billingMode"]} label="计费方式" rules={[{ required: true }]}>
+                    <Segmented
+                        className="w-full"
+                        options={[
+                            { label: "按次", value: "fixed_request" },
+                            { label: "按秒", value: "per_second", disabled: !isVideo },
+                            { label: "Token", value: "token", disabled: !tokenEnabled },
+                        ]}
+                    />
+                </Form.Item>
+                {billingMode === "token" ? (
+                    isVideo ? (
+                        <Form.Item className="mb-0 lg:col-span-3" name={[index, "outputTokenPrice"]} label="视频 / 百万 Token" rules={[{ required: true, message: "请输入视频 Token 价格" }]}>
+                            <InputNumber className="w-full" min={0.000001} max={1_000_000} precision={6} step={0.1} />
+                        </Form.Item>
+                    ) : (
+                        <div className="grid gap-3 sm:grid-cols-3 lg:col-span-5">
+                            <Form.Item className="mb-0" name={[index, "inputTokenPrice"]} label="输入 / 百万 Token" rules={[{ required: true, message: "请输入输入价格" }]}><InputNumber className="w-full" min={0} max={1_000_000} precision={6} step={0.1} /></Form.Item>
+                            <Form.Item className="mb-0" name={[index, "outputTokenPrice"]} label="输出 / 百万 Token" rules={[{ required: true, message: "请输入输出价格" }]}><InputNumber className="w-full" min={0} max={1_000_000} precision={6} step={0.1} /></Form.Item>
+                            <Form.Item className="mb-0" name={[index, "cachedTokenPrice"]} label="缓存 / 百万 Token" rules={[{ required: true, message: "请输入缓存价格" }]}><InputNumber className="w-full" min={0} max={1_000_000} precision={6} step={0.1} /></Form.Item>
+                        </div>
+                    )
+                ) : (
+                    <Form.Item className="mb-0 lg:col-span-3" name={[index, "unitPrice"]} label={billingMode === "per_second" ? "每秒消耗积分" : "每次消耗积分"} rules={[{ required: true, message: "请输入积分价格" }]}>
+                        <InputNumber className="w-full" min={0} max={1_000_000} precision={6} step={0.1} />
+                    </Form.Item>
+                )}
+                <div className={`flex items-center gap-6 ${controlsColumnClass}`}>
+                    <Form.Item name={[index, "priceConfigured"]} label="价格已配置" valuePropName="checked" className="mb-0"><Switch /></Form.Item>
+                    <Form.Item name={[index, "enabled"]} label="启用此价格档" valuePropName="checked" className="mb-0"><Switch /></Form.Item>
+                </div>
+            </div>
         </div>
     );
+}
+
+function defaultPriceTier(): PriceTierFormValues {
+	return { operation: "*", quality: "*", size: "*", resolution: "*", videoSeconds: 0, imageCount: 0, providerModelKey: "", billingMode: "fixed_request", unitPrice: 0, inputTokenPrice: 0, outputTokenPrice: 0, cachedTokenPrice: 0, priceConfigured: true, enabled: true };
+}
+
+function priceTierToForm(tier: ChannelModelPriceTier): PriceTierFormValues {
+    return {
+		operation: tier.selector?.operation || "*", quality: tier.selector?.quality || "*", size: tier.selector?.size || "*",
+		resolution: tier.resolution || "*", videoSeconds: tier.videoSeconds || 0, imageCount: Number(tier.selector?.imageCount || 0), providerModelKey: tier.providerModelKey || "", billingMode: tier.billingMode,
+        unitPrice: tier.unitPriceMicrocredits / 1_000_000, inputTokenPrice: tier.inputTokenPriceMicrocredits / 1_000_000,
+        outputTokenPrice: tier.outputTokenPriceMicrocredits / 1_000_000, cachedTokenPrice: tier.cachedTokenPriceMicrocredits / 1_000_000,
+        priceConfigured: tier.priceConfigured, enabled: tier.enabled,
+    };
+}
+
+function legacyPriceTierToForm(item: ChannelModel): PriceTierFormValues {
+    return {
+		operation: "*", quality: "*", size: "*", resolution: "*", videoSeconds: 0, imageCount: 0, providerModelKey: item.providerModelKey || "", billingMode: item.billingMode,
+        unitPrice: item.unitPriceMicrocredits / 1_000_000, inputTokenPrice: item.inputTokenPriceMicrocredits / 1_000_000,
+        outputTokenPrice: item.outputTokenPriceMicrocredits / 1_000_000, cachedTokenPrice: item.cachedTokenPriceMicrocredits / 1_000_000,
+        priceConfigured: item.priceConfigured, enabled: item.enabled,
+    };
+}
+
+function billingSummary(item: ChannelModel) {
+	const tiers = item.priceTiers?.filter((tier) => tier.enabled && tier.priceConfigured) || [];
+	if (!tiers.length) return <AdminStatusBadge label="未配置价格" tone="warning" />;
+	return <div className="space-y-1 text-xs leading-5">{tiers.slice(0, 3).map((tier) => <div key={tier.id}>{priceTierLabel(tier)}</div>)}{tiers.length > 3 ? <div className="text-foreground/45">另有 {tiers.length - 3} 个规格价格档</div> : null}</div>;
+}
+
+function priceTierLabel(tier: ChannelModelPriceTier) {
+    const selector = tier.selector || {};
+    const specParts = [
+        selector.operation && selector.operation !== "*" ? operationLabel(selector.operation) : "任意生成方式",
+        selector.quality && selector.quality !== "*" ? selector.quality.toUpperCase() : "",
+        selector.size && selector.size !== "*" ? selector.size : "",
+        tier.resolution === "*" ? "" : tier.resolution.toUpperCase(),
+		tier.videoSeconds ? `${tier.videoSeconds} 秒` : "",
+		selector.imageCount && selector.imageCount !== "*" ? `${selector.imageCount} 张参考图` : "",
+    ].filter(Boolean);
+    const spec = specParts.length ? specParts.join(" / ") : "默认规格";
+    if (tier.billingMode === "token") return `${spec} · ${formatCredits(tier.outputTokenPriceMicrocredits)} / 百万 Token`;
+    return `${spec} · ${formatCredits(tier.unitPriceMicrocredits)} 积分 / ${tier.billingMode === "per_second" ? "秒" : "次"}`;
+}
+
+function operationOptions(capability: EditableCapability | undefined) {
+	const options = [{ label: "任意生成方式", value: "*" }];
+	if (capability === "image") return [...options, { label: "文生图", value: "text_to_image" }, { label: "图生图", value: "image_to_image" }];
+	if (capability === "video") return [...options, { label: "文生视频", value: "text_to_video" }, { label: "图生视频", value: "image_to_video" }, { label: "视频生视频", value: "video_to_video" }];
+	if (capability === "text") return [...options, { label: "文本生成", value: "text_generation" }];
+	return options;
+}
+
+function operationLabel(operation: string) {
+	return ({ text_to_image: "文生图", image_to_image: "图生图", text_to_video: "文生视频", image_to_video: "图生视频", video_to_video: "视频生视频", text_generation: "文本生成" } as Record<string, string>)[operation] || operation;
+}
+
+function skuSelectorFromForm(capability: EditableCapability, tier: PriceTierFormValues) {
+	const selector: Record<string, string> = {};
+	if (tier.operation && tier.operation !== "*") selector.operation = tier.operation;
+	if (capability === "video") {
+		if (tier.resolution && tier.resolution !== "*") selector.vquality = tier.resolution;
+		if (Number(tier.videoSeconds) > 0) selector.videoSeconds = String(Number(tier.videoSeconds));
+		if (Number(tier.imageCount) > 0) selector.imageCount = String(Number(tier.imageCount));
+	}
+	if (capability === "image") {
+		if (tier.quality && tier.quality !== "*") selector.quality = tier.quality;
+		if (tier.size && tier.size !== "*") selector.size = tier.size;
+	}
+	return selector;
 }
 
 function formatCredits(value: number) {

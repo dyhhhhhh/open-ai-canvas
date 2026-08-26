@@ -1,7 +1,7 @@
 import { DREAMINA_SUBMIT_ERROR_MESSAGES, generationErrorMessage } from "@/lib/generation-error";
 import { apiClient, request, type BackendEnvelope } from "@/services/api/request";
+import { recordDiagnosticEvent } from "@/services/diagnostics/client-diagnostics";
 import {
-    cancelLocalDreaminaGenerationTask,
     deleteLocalDreaminaGenerationTask,
     listLocalDreaminaGenerationTaskPage,
     queryLocalDreaminaGenerationTask,
@@ -220,6 +220,7 @@ export function uploadAgentFile(sessionId: string, file: File) {
 
 export function createGenerationTask(input: CreateTaskInput) {
     return request<GenerationTask>(api.post("/tasks", input)).then((task) => {
+        recordDiagnosticEvent({ level: "info", category: "task", message: "任务已创建", taskId: task.id, projectId: task.projectId });
         notifyCanvasTaskCreated(task);
         // 创建任务时积分已被预占，不能等任务结束后才刷新可用余额。
         window.dispatchEvent(new CustomEvent("wallet:updated"));
@@ -407,13 +408,6 @@ export function queryFailedVideoProviderTask(id: string) {
     return request<ProviderTaskQueryResult>(api.post(`/tasks/${encodeURIComponent(id)}/query-provider`));
 }
 
-export function cancelGenerationTask(id: string) {
-    if (isLocalDreaminaTaskId(id)) {
-        return cancelLocalDreaminaGenerationTask(stripLocalDreaminaTaskPrefix(id)).then((task) => projectLocalDreaminaTask(task));
-    }
-    return request<GenerationTask>(api.post(`/tasks/${encodeURIComponent(id)}/cancel`));
-}
-
 export function refreshGenerationTaskStatus(id: string, options?: { signal?: AbortSignal }) {
     if (!isLocalDreaminaTaskId(id)) return Promise.reject(new Error("当前任务不支持手动更新官方状态"));
     return refreshLocalDreaminaGenerationTask(stripLocalDreaminaTaskPrefix(id), {}, options?.signal).then((task) => projectLocalDreaminaTask(task));
@@ -531,8 +525,7 @@ export async function waitForGenerationTask(id: string, options?: { signal?: Abo
         }
     } catch (error) {
         if (options?.signal?.aborted) {
-            await cancelGenerationTask(id).catch(() => undefined);
-            window.dispatchEvent(new CustomEvent("wallet:updated"));
+            // Abort 只停止当前页面的状态监听，不能把已发起的上游任务改成取消状态。
             throw new DOMException("Aborted", "AbortError");
         }
         throw error;

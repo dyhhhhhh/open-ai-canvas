@@ -46,6 +46,11 @@ export type AccountFileStorageUsage = {
     totalBytes: number;
 };
 
+export type ArkPrivateAssetSync = {
+    resourceId: string;
+    status: "active" | string;
+};
+
 const api = apiClient;
 const resourceCache = new Map<string, RemoteResource>();
 const resourceRequests = new Map<string, Promise<RemoteResource>>();
@@ -66,6 +71,11 @@ export function updateUserOSSSetting(input: UserOSSSettingInput) {
 export async function getAccountFileStorageUsage() {
     const data = await request<{ usage: AccountFileStorageUsage }>(api.get("/resources/storage-usage"));
     return data.usage;
+}
+
+export async function syncResourceToArkPrivateAsset(id: string) {
+    const data = await request<{ sync: ArkPrivateAssetSync }>(api.post(`/resources/${encodeURIComponent(id)}/ark-private-asset`));
+    return data.sync;
 }
 
 export function resourceIdFromStorageKey(storageKey?: string) {
@@ -145,11 +155,11 @@ function resourceProxyFileUrl(id: string) {
     return `${base}/resources/${encodeURIComponent(id)}/file?proxy=1`;
 }
 
-export async function resolveResourceUrl(storageKey?: string, fallback = "") {
+export function resolveResourceUrl(storageKey?: string, fallback = "") {
     const id = resourceIdFromStorageKey(storageKey);
-    if (!id) return fallback;
-    const resource = await getResource(id).catch(() => null);
-    return resource ? resource.publicUrl || resourceFileUrl(id) : fallback;
+    // 资源引用本身已经包含稳定 ID；恢复/展示阶段不需要再查一遍元数据。
+    // 需要 publicUrl、mime 或尺寸时必须显式调用 getResource，避免隐式 N+1。
+    return id ? resourceFileUrl(id) : fallback;
 }
 
 export async function getResourceBlob(storageKey: string) {

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { canvasThemes, type CanvasBackgroundMode } from "@/lib/canvas-theme";
-import { applyCanvasLiveViewport, subscribeCanvasViewportPreview } from "@/lib/canvas/canvas-live-viewport";
+import { applyCanvasLiveViewport, canvasDotGridPx, canvasDotPx, subscribeCanvasViewportPreview } from "@/lib/canvas/canvas-live-viewport";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { ViewportTransform } from "@/types/canvas";
 
@@ -39,7 +39,7 @@ type PinchState = {
     initialScale: number;
 };
 
-export function InfiniteCanvas({ containerRef, viewport, backgroundMode = "dots", onViewportChange, onViewportPreviewChange, onCanvasMouseDown, boxSelectEnabled = false, onCanvasDoubleClick, onCanvasDeselect, onContextMenu, onDrop, onFileDragEnter, onFileDragLeave, onFileDragOver, graphicsLayer, children }: InfiniteCanvasProps) {
+export function InfiniteCanvas({ containerRef, viewport, backgroundMode = "lines", onViewportChange, onViewportPreviewChange, onCanvasMouseDown, boxSelectEnabled = false, onCanvasDoubleClick, onCanvasDeselect, onContextMenu, onDrop, onFileDragEnter, onFileDragLeave, onFileDragOver, graphicsLayer, children }: InfiniteCanvasProps) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const panState = useRef({
         isPanning: false,
@@ -382,7 +382,10 @@ export function InfiniteCanvas({ containerRef, viewport, backgroundMode = "dots"
                 "--canvas-grid-size": `${48 * viewport.k}px`,
                 "--canvas-grid-x": `${viewport.x % (48 * viewport.k)}px`,
                 "--canvas-grid-y": `${viewport.y % (48 * viewport.k)}px`,
-                "--canvas-dot-size": viewport.k < 0.12 ? "0.8px" : "1.15px",
+                "--canvas-dot-grid-size": `${canvasDotGridPx(viewport.k)}px`,
+                "--canvas-dot-grid-x": `${viewport.x % canvasDotGridPx(viewport.k)}px`,
+                "--canvas-dot-grid-y": `${viewport.y % canvasDotGridPx(viewport.k)}px`,
+                "--canvas-dot-size": canvasDotPx(viewport.k),
             } as React.CSSProperties}
             onPointerDown={handlePointerDown}
             onDoubleClick={(event) => {
@@ -422,11 +425,11 @@ function CanvasGrid({ mode }: { mode: CanvasBackgroundMode }) {
             data-canvas-grid-layer
             className="pointer-events-none absolute"
             style={{
-                inset: "calc(-1 * var(--canvas-grid-size))",
+                inset: mode === "dots" ? "calc(-1 * var(--canvas-dot-grid-size))" : "calc(-1 * var(--canvas-grid-size))",
                 backgroundImage,
-                backgroundSize: "var(--canvas-grid-size) var(--canvas-grid-size)",
-                transform: "translate3d(var(--canvas-grid-x), var(--canvas-grid-y), 0)",
-                opacity: mode === "dots" ? 0.28 : 0.2,
+                backgroundSize: mode === "dots" ? "var(--canvas-dot-grid-size) var(--canvas-dot-grid-size)" : "var(--canvas-grid-size) var(--canvas-grid-size)",
+                transform: mode === "dots" ? "translate3d(var(--canvas-dot-grid-x), var(--canvas-dot-grid-y), 0)" : "translate3d(var(--canvas-grid-x), var(--canvas-grid-y), 0)",
+                opacity: mode === "dots" ? 0.34 : 0.46,
                 willChange: "transform",
             }}
         />

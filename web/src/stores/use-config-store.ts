@@ -11,9 +11,9 @@ import type { ModelCapabilityConfig } from "@/lib/model-capabilities";
 import { useLocalDreaminaModelStore } from "@/stores/use-local-dreamina-model-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { DreaminaLocalModel } from "@/services/local-dreamina-model-catalog";
-import type { CapabilitySpec } from "@/services/api/logical-models";
+import type { CapabilitySpec, PublicLogicalModelPriceTier } from "@/services/api/logical-models";
 
-export type ApiCallFormat = "openai" | "gemini";
+export type ApiCallFormat = "openai" | "gemini" | "claude";
 export type ChannelInterfaceType = ModelProtocol;
 export type ChannelHeader = { name: string; value: string };
 
@@ -31,6 +31,8 @@ export type ModelChannel = {
     apiFormat: ApiCallFormat;
     interfaceType?: ChannelInterfaceType;
     models: string[];
+    // 仅平台目录使用：将已保存的旧 SKU 选择重定向到当前模型家族。
+    modelAliases?: Record<string, string>;
     scope?: "system" | "user";
     enabled?: boolean;
     hasApiKey?: boolean;
@@ -53,6 +55,7 @@ export type ModelChannel = {
         logicalModelId?: string;
         logicalCapabilitySpec?: CapabilitySpec;
         logicalCapabilityProfiles?: CapabilitySpec[];
+		logicalPriceTiers?: PublicLogicalModelPriceTier[];
         defaultOptions?: Record<string, unknown>;
     }>;
     transport?: "backend-channel" | "local-runtime";
@@ -78,6 +81,7 @@ export type AiConfig = {
     vquality: string;
     videoGenerateAudio: string;
     videoWatermark: string;
+    videoArkPrivateAssetUpload: string;
     systemPrompt: string;
     models: string[];
     imageModels: string[];
@@ -118,6 +122,7 @@ export const defaultConfig: AiConfig = {
     vquality: "720",
     videoGenerateAudio: "true",
     videoWatermark: "false",
+    videoArkPrivateAssetUpload: "true",
     systemPrompt: "",
     models: [],
     imageModels: [],
@@ -335,6 +340,7 @@ export function normalizeConfigSnapshot(snapshot: ConfigStoreSnapshot | undefine
             vquality: normalizeVideoResolution(config.vquality),
             videoGenerateAudio: config.videoGenerateAudio || "true",
             videoWatermark: config.videoWatermark || "false",
+            videoArkPrivateAssetUpload: config.videoArkPrivateAssetUpload || "true",
             transparentBackground: config.transparentBackground === "true" ? "true" : "false",
             canvasImageCount: config.canvasImageCount || defaultConfig.canvasImageCount,
             imageModels,
@@ -472,7 +478,21 @@ export function modelOptionsFromChannels(channels: ModelChannel[]) {
 
 export function hasSystemModelPrice(channel: ModelChannel, model: string) {
     if (channel.scope !== "system") return true;
-    return channel.modelCosts?.some((item) => item.model === model && Number.isFinite(item.unitPriceMicrocredits) && item.unitPriceMicrocredits >= 0) === true;
+    // 价格字段已由后端按“非负数”校验；0 表示免费模型，不能在目录重建时被过滤。
+    const configured = (value: number | undefined) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+    return channel.modelCosts?.some((item) => {
+        if (item.model !== model) return false;
+        const tiers = item.logicalPriceTiers || [];
+        if (tiers.length) {
+            return tiers.some((tier) => tier.billingMode === "token"
+                ? [tier.inputTokenPriceMicrocredits, tier.outputTokenPriceMicrocredits, tier.cachedTokenPriceMicrocredits].every(configured)
+                : configured(tier.unitPriceMicrocredits));
+        }
+        if (item.billingMode === "token") {
+            return [item.inputTokenPriceMicrocredits, item.outputTokenPriceMicrocredits, item.cachedTokenPriceMicrocredits].every(configured);
+        }
+        return configured(item.unitPriceMicrocredits);
+    }) === true;
 }
 
 export function normalizeModelOptionValue(value: unknown, channels: ModelChannel[]) {
@@ -481,10 +501,12 @@ export function normalizeModelOptionValue(value: unknown, channels: ModelChannel
     const decoded = decodeChannelModel(model);
     if (decoded) {
         const channel = channels.find((item) => item.id === decoded.channelId);
-        return channel && channel.models.includes(decoded.model) ? model : "";
+        const resolved = channel?.modelAliases?.[decoded.model] || decoded.model;
+        return channel && channel.models.includes(resolved) ? encodeChannelModel(channel.id, resolved) : "";
     }
-    const channel = channels.find((item) => item.models.includes(model)) || channels[0];
-    return channel && channel.models.includes(model) ? encodeChannelModel(channel.id, model) : "";
+    const channel = channels.find((item) => item.models.includes(model) || Boolean(item.modelAliases?.[model])) || channels[0];
+    const resolved = channel?.modelAliases?.[model] || model;
+    return channel && channel.models.includes(resolved) ? encodeChannelModel(channel.id, resolved) : "";
 }
 
 export function resolveModelChannel(config: AiConfig, value: string) {
@@ -492,6 +514,11 @@ export function resolveModelChannel(config: AiConfig, value: string) {
     const model = decoded?.model || value;
     const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channel.models.includes(model));
     return matched || config.channels[0] || createModelChannel({ id: "default", name: "默认渠道", baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName) });
+}
+
+export function logicalModelIDForConfig(config: AiConfig) {
+    const channel = resolveModelChannel(config, config.model);
+    return channel.modelCosts?.find((item) => item.model === modelOptionName(config.model))?.logicalModelId || "";
 }
 
 export function channelConnectionSignature(channel: ModelChannel) {
@@ -511,7 +538,7 @@ export function resolveModelRequestConfig(config: AiConfig, value: string) {
         apiKey: channel.apiKey,
         secretKey: channel.secretKey,
         headers: channel.headers,
-        apiFormat: interfaceType ? (interfaceType === "gemini-veo" || interfaceType === "gemini-image" ? ("gemini" as const) : ("openai" as const)) : channel.apiFormat,
+        apiFormat: interfaceType ? (interfaceType === "gemini-veo" || interfaceType === "gemini-image" ? ("gemini" as const) : interfaceType === "claude-api" ? ("claude" as const) : ("openai" as const)) : channel.apiFormat,
         interfaceType,
         channelId: channel.scope === "system" ? channel.id : "",
     });
@@ -565,6 +592,7 @@ export function defaultBaseUrlForChannelInterface(interfaceType?: ChannelInterfa
     if (interfaceType === "volcengine-ark-image" || interfaceType === "volcengine-ark-video") return "https://ark.cn-beijing.volces.com/api/v3";
     if (interfaceType === "volcengine-plan-tts") return "https://openspeech.bytedance.com";
     if (interfaceType === "volcengine-jimeng-image" || interfaceType === "volcengine-jimeng-video") return "https://visual.volcengineapi.com";
+    if (interfaceType === "minimax-video") return "https://api.minimaxi.com";
     if (interfaceType === "grok-image" || interfaceType === "newapi" || interfaceType === "newapi-channel-1" || interfaceType === "newapi-channel-2" || interfaceType === "xai-video") return "";
     return OPENAI_BASE_URL;
 }
@@ -574,7 +602,7 @@ function capabilityForChannelInterface(interfaceType?: ChannelInterfaceType): Mo
 }
 
 function normalizeApiFormat(apiFormat: unknown): ApiCallFormat {
-    return apiFormat === "gemini" ? "gemini" : "openai";
+    return apiFormat === "gemini" || apiFormat === "claude" ? apiFormat : "openai";
 }
 
 function normalizeChannelInterfaceType(value: unknown): ChannelInterfaceType | undefined {
@@ -605,9 +633,25 @@ function normalizeRawModelName(value: unknown) {
 export function buildApiUrl(baseUrl: string, path: string) {
     let normalizedBaseUrl = resolveBackendApiUrl(baseUrl).replace(/\/+$/, "");
     normalizedBaseUrl = normalizeArkPlanBaseUrl(normalizedBaseUrl);
-    const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
-    const apiBaseUrl = isSystemProxyBaseUrl(normalizedBaseUrl) || lowerBaseUrl.endsWith("/v1") || lowerBaseUrl.endsWith("/api/v3") || lowerBaseUrl.endsWith("/api/plan/v3") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
-    return `${apiBaseUrl}${path}`;
+    const requestPath = path.startsWith("/") ? path : `/${path}`;
+    if (isSystemProxyBaseUrl(normalizedBaseUrl)) return `${normalizedBaseUrl}${requestPath}`;
+
+    const knownPrefixes = ["/api/plan/v3", "/api/v3", "/v1beta", "/v1", "/v2", "/v3"];
+    const requestPrefixFor = (value: string) => knownPrefixes.find((prefix) => {
+        const lower = value.toLowerCase();
+        return lower === prefix || lower.startsWith(`${prefix}/`) || lower.startsWith(`${prefix}?`) || lower.startsWith(`${prefix}#`);
+    }) || "";
+    const basePrefixFor = (value: string) => knownPrefixes.find((prefix) => {
+        const lower = value.toLowerCase();
+        return lower.endsWith(prefix) || lower.includes(`${prefix}/`) || lower.includes(`${prefix}?`) || lower.includes(`${prefix}#`);
+    }) || "";
+    const basePrefix = basePrefixFor(normalizedBaseUrl);
+    const requestPrefix = requestPrefixFor(requestPath);
+    if (requestPrefix) {
+        const root = basePrefix ? normalizedBaseUrl.slice(0, -basePrefix.length) : normalizedBaseUrl;
+        return `${root}${requestPath}`;
+    }
+    return `${normalizedBaseUrl}${basePrefix ? "" : "/v1"}${requestPath}`;
 }
 
 export function resolveBackendApiUrl(value: string) {
@@ -620,11 +664,21 @@ export function resolveBackendApiUrl(value: string) {
 }
 
 export function isSystemProxyBaseUrl(baseUrl: string) {
-    const marker = "/api/ai/system/";
-    const index = baseUrl.toLowerCase().indexOf(marker);
-    if (index < 0) return false;
-    const channelId = baseUrl.slice(index + marker.length);
-    return Boolean(channelId && !channelId.includes("/") && !channelId.includes("?") && !channelId.includes("#"));
+    return Boolean(systemProxyChannelId(baseUrl));
+}
+
+export function systemProxyChannelId(baseUrl: string) {
+    const value = baseUrl.trim();
+    const lowerValue = value.toLowerCase();
+    for (const marker of ["/api/ai/system/", "/api/"]) {
+        const index = lowerValue.lastIndexOf(marker);
+        if (index < 0) continue;
+        const remainder = value.slice(index + marker.length);
+        if (/[/?#]/.test(remainder)) continue;
+        const channelId = remainder.trim();
+        if (channelId && !channelId.includes("\\") && !["v1", "v1beta", "v2", "v3", "plan", "ai"].includes(channelId.toLowerCase())) return channelId;
+    }
+    return "";
 }
 
 function normalizeArkPlanBaseUrl(baseUrl: string) {

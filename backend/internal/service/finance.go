@@ -474,7 +474,7 @@ func (s *Service) newLogicalModelBillingOrder(userID string, task *model.Task, i
 		capability = capabilityFromTaskType(task.Type)
 	}
 	if logicalModel.PricePolicy == "channel" {
-		order, priceErr := s.newBillingOrder(userID, task.ID, "task:"+task.ID+":"+newID(), channelModel.ChannelID, channelModel.ModelKey, capability, firstNonEmpty(strings.TrimSpace(task.Operation), task.Type), billingQuantity(capability, config["videoSeconds"]), estimateTaskBillingTokens(input, capability))
+		order, priceErr := s.newBillingOrderWithPriceTier(userID, task.ID, "task:"+task.ID+":"+newID(), channelModel.ChannelID, channelModel.ModelKey, capability, firstNonEmpty(strings.TrimSpace(task.Operation), task.Type), billingQuantity(capability, config["videoSeconds"]), estimateTaskBillingTokens(input, capability), strings.TrimSpace(fmt.Sprint(config["priceTierId"])))
 		if priceErr != nil {
 			return nil, priceErr
 		}
@@ -498,6 +498,9 @@ func (s *Service) newLogicalModelBillingOrder(userID string, task *model.Task, i
 		}
 		amount, err = creditAmount(logicalModel.UnitPriceMicrocredits, quantity, 10_000)
 	case "token":
+		if channelModel.Capability != capability || !supportsTokenBilling(capability, channelModel.Protocol) {
+			return nil, BadAuthRequest("当前供应线路不支持前台模型的 Token 计费方式")
+		}
 		pricing := &model.ChannelModel{InputTokenPriceMicrocredits: logicalModel.InputPriceMicrocredits, OutputTokenPriceMicrocredits: logicalModel.OutputPriceMicrocredits, CachedTokenPriceMicrocredits: logicalModel.CachedPriceMicrocredits}
 		amount, err = tokenEstimateAmount(pricing, tokenEstimate, 10_000)
 		quantity = tokenEstimate.InputTokens + tokenEstimate.OutputTokens
@@ -554,6 +557,10 @@ func (s *Service) ReserveProxyBillingWithBody(userID string, channelID string, m
 }
 
 func (s *Service) newBillingOrder(userID string, taskID string, idempotencyKey string, channelID string, modelKey string, capability string, scene string, requestedQuantity int64, tokenEstimate tokenBillingEstimate) (*model.BillingOrder, error) {
+	return s.newBillingOrderWithPriceTier(userID, taskID, idempotencyKey, channelID, modelKey, capability, scene, requestedQuantity, tokenEstimate, "")
+}
+
+func (s *Service) newBillingOrderWithPriceTier(userID string, taskID string, idempotencyKey string, channelID string, modelKey string, capability string, scene string, requestedQuantity int64, tokenEstimate tokenBillingEstimate, priceTierID string) (*model.BillingOrder, error) {
 	item, err := s.repo.ChannelModelByKey(channelID, modelKey)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, BadAuthRequest("当前模型暂时不可用，请重新选择")
@@ -561,12 +568,13 @@ func (s *Service) newBillingOrder(userID string, taskID string, idempotencyKey s
 	if err != nil {
 		return nil, err
 	}
-	if !item.PriceConfigured {
-		return nil, BadAuthRequest("当前模型尚未配置用户积分价格")
+	tier := channelModelPriceTierForBilling(*item, priceTierID, capability)
+	if tier == nil {
+		return nil, BadAuthRequest("当前模型尚未配置所选规格的用户积分价格")
 	}
 	quantity := int64(1)
 	amount := int64(0)
-	switch item.BillingMode {
+	switch tier.BillingMode {
 	case "fixed_request":
 	case "per_second":
 		if item.Capability != "video" || capability != "video" {
@@ -598,23 +606,36 @@ func (s *Service) newBillingOrder(userID string, taskID string, idempotencyKey s
 	if configured := policy.ModelMultiplierBPS[modelKey]; configured > 0 {
 		multiplierBPS = configured
 	}
-	if item.BillingMode == "token" {
-		amount, err = tokenEstimateAmount(item, tokenEstimate, multiplierBPS)
+	if tier.BillingMode == "token" {
+		amount, err = tokenEstimateAmount(&model.ChannelModel{InputTokenPriceMicrocredits: tier.InputTokenPriceMicrocredits, OutputTokenPriceMicrocredits: tier.OutputTokenPriceMicrocredits, CachedTokenPriceMicrocredits: tier.CachedTokenPriceMicrocredits}, tokenEstimate, multiplierBPS)
 	} else {
-		amount, err = creditAmount(item.UnitPriceMicrocredits, quantity, multiplierBPS)
+		amount, err = creditAmount(tier.UnitPriceMicrocredits, quantity, multiplierBPS)
 	}
 	if err != nil {
 		return nil, err
 	}
 	return &model.BillingOrder{
 		ID: newID(), UserID: userID, IdempotencyKey: idempotencyKey, TaskID: taskID,
-		ChannelID: channelID, ChannelModelID: item.ID, Model: modelKey, Capability: capability,
-		Scene: truncateRunes(scene, 80), BillingMode: item.BillingMode, PriceVersion: item.PriceVersion,
-		UnitPriceMicrocredits: item.UnitPriceMicrocredits, MultiplierBasisPoints: multiplierBPS, Quantity: quantity, AmountMicrocredits: amount,
-		ReservedAmountMicrocredits: amount, InputTokenPriceMicrocredits: item.InputTokenPriceMicrocredits,
-		OutputTokenPriceMicrocredits: item.OutputTokenPriceMicrocredits, CachedTokenPriceMicrocredits: item.CachedTokenPriceMicrocredits,
+		ChannelID: channelID, ChannelModelID: item.ID, PriceTierID: tier.ID, PriceTierVersion: tier.PriceVersion, PriceSelectorJSON: tier.SelectorJSON, Model: modelKey, Capability: capability,
+		Scene: truncateRunes(scene, 80), BillingMode: tier.BillingMode, PriceVersion: item.PriceVersion,
+		UnitPriceMicrocredits: tier.UnitPriceMicrocredits, MultiplierBasisPoints: multiplierBPS, Quantity: quantity, AmountMicrocredits: amount,
+		ReservedAmountMicrocredits: amount, InputTokenPriceMicrocredits: tier.InputTokenPriceMicrocredits,
+		OutputTokenPriceMicrocredits: tier.OutputTokenPriceMicrocredits, CachedTokenPriceMicrocredits: tier.CachedTokenPriceMicrocredits,
 		Status: model.BillingStatusReserved,
 	}, nil
+}
+
+func channelModelPriceTierForBilling(channelModel model.ChannelModel, priceTierID string, capability string) *model.ChannelModelPriceTier {
+	if priceTierID != "" {
+		for index := range channelModel.PriceTiers {
+			tier := &channelModel.PriceTiers[index]
+			if tier.ID == priceTierID && tier.Enabled && tier.PriceConfigured {
+				return tier
+			}
+		}
+		return nil
+	}
+	return channelModelPriceTierForIntent(channelModel, ModelRequestIntent{Capability: capability, Options: map[string]any{}})
 }
 
 func estimateTaskTokens(input map[string]any) tokenBillingEstimate {
@@ -790,59 +811,23 @@ func billingQuantity(capability string, value any) int64 {
 }
 
 func (s *Service) MarkBillingRunning(orderID string) error {
-	if orderID == "" {
-		return nil
-	}
-	return s.repo.MarkBillingRunning(orderID)
+	return s.taskBilling().MarkBillingRunning(orderID)
 }
 
 func (s *Service) SettleBilling(orderID string, providerRequestID string) error {
-	if orderID == "" {
-		return nil
-	}
-	return s.repo.SettleBillingOrder(orderID, providerRequestID)
+	return s.taskBilling().SettleBilling(orderID, providerRequestID)
 }
 
 func (s *Service) RefundBilling(orderID string, errorText string) error {
-	if orderID == "" {
-		return nil
-	}
-	return s.repo.RefundBillingOrder(orderID, truncateRunes(errorText, 1000))
+	return s.taskBilling().RefundBilling(orderID, errorText)
 }
 
 func (s *Service) MarkBillingUncertain(orderID string, errorText string) error {
-	if orderID == "" {
-		return nil
-	}
-	return s.repo.MarkBillingUncertain(orderID, truncateRunes(errorText, 1000))
+	return s.taskBilling().MarkBillingUncertain(orderID, errorText)
 }
 
 func (s *Service) BillingFailureRequiresReview(orderID string, taskID string, err error) bool {
-	if orderID == "" {
-		return false
-	}
-	if billingFailureUncertain(err) {
-		return true
-	}
-	order, orderErr := s.repo.BillingOrder(orderID)
-	if orderErr != nil || order.Status == model.BillingStatusUncertain {
-		return true
-	}
-	hasSuccessfulCall, logErr := s.repo.TaskHasSuccessfulBillableCall(taskID)
-	return logErr != nil || hasSuccessfulCall
-}
-
-func billingFailureUncertain(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	for _, marker := range []string{"524", "timeout", "超时", "deadline exceeded", "context canceled", "connection reset", "unexpected eof", "broken pipe"} {
-		if strings.Contains(message, marker) {
-			return true
-		}
-	}
-	return false
+	return s.taskBilling().BillingFailureRequiresReview(orderID, taskID, err)
 }
 
 func newRedeemCode() (string, error) {

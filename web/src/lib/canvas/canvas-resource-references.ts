@@ -1,4 +1,5 @@
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
+import { getNodeResourceKind } from "@/lib/canvas/node-registry";
 import { seedanceReferenceLabel } from "@/lib/seedance-video";
 import type { Skill } from "@/services/api/skills";
 import type { Asset, AssetCategory } from "@/stores/use-asset-store";
@@ -26,6 +27,17 @@ export function canvasResourceMentionToken(reference: CanvasResourceReference) {
     if (reference.kind === "skill" && reference.skill?.skill_id) return `@[skill:${reference.skill.skill_id}]`;
     if (reference.assetId) return `@[asset:${reference.assetId}]`;
     return `@[node:${reference.nodeId}]`;
+}
+
+export function removeCanvasResourceMention(prompt: string, reference: CanvasResourceReference) {
+    const token = canvasResourceMentionToken(reference);
+    if (!token || !prompt.includes(token)) return prompt;
+    return prompt
+        .split(token)
+        .join("")
+        .replace(/[ \t]{2,}/g, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
 }
 
 export function buildAssetMentionReferences(assets: Asset[]): CanvasResourceReference[] {
@@ -94,7 +106,11 @@ export function collectUpstreamVideoNodes(nodeId: string, nodes: CanvasNodeData[
     return result;
 }
 
-function getContextResourceNodes(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[]) {
+/**
+ * 该节点的直接上游素材节点（按连线取 fromNodeId，只保留构成素材的）。
+ * 扩展节点经 CanvasNodeGraphContext 复用它，不要另写一份取上游的逻辑。
+ */
+export function getContextResourceNodes(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[]) {
     return connections
         .filter((connection) => connection.toNodeId === nodeId)
         .map((connection) => nodes.find((node) => node.id === connection.fromNodeId))
@@ -146,14 +162,9 @@ function isResourceNode(node: CanvasNodeData) {
 }
 
 function resourceKind(node: CanvasNodeData): CanvasResourceKind | null {
+    // 角色卡是跨类型覆盖：任何节点带上角色元数据都按角色处理，故先于按类型判定。
     if (node.metadata?.workflowKind === "character" && node.metadata.characterAssetId) return "character";
-    if (node.type === CanvasNodeType.Image && node.metadata?.content) return "image";
-    if (node.type === CanvasNodeType.Drawing && node.metadata?.drawingId) return "image";
-    if (node.type === CanvasNodeType.Video && node.metadata?.content) return "video";
-    if (node.type === CanvasNodeType.Audio && node.metadata?.content) return "audio";
-    if (node.type === CanvasNodeType.Text && (node.metadata?.content || node.metadata?.prompt)) return "text";
-    if (node.type === CanvasNodeType.Skill && (node.metadata?.skillSnapshot || node.metadata?.content)) return "text";
-    return null;
+    return getNodeResourceKind(node);
 }
 
 function skillResourceText(node: CanvasNodeData) {

@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
+	"strconv"
 
 	"infinite-canvas/backend/internal/service"
 
@@ -29,12 +31,33 @@ func RegisterProjectRoutes(r *gin.RouterGroup, svc *service.Service) {
 			failService(c, err)
 			return
 		}
-		projects, err := svc.ListProjects(user.ID)
-		if err != nil {
-			fail(c, http.StatusInternalServerError, err)
+		pageParam, hasPage := c.GetQuery("page")
+		pageSizeParam, hasPageSize := c.GetQuery("page_size")
+		if !hasPage && !hasPageSize {
+			projects, err := svc.ListProjects(user.ID)
+			if err != nil {
+				failService(c, err)
+				return
+			}
+			ok(c, gin.H{"projects": projects})
 			return
 		}
-		ok(c, gin.H{"projects": projects})
+		page, err := parsePositiveQueryInt(pageParam, 1)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		pageSize, err := parsePositiveQueryInt(pageSizeParam, 50)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		projects, err := svc.ListProjectsPage(user.ID, page, pageSize)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		ok(c, projects)
 	})
 	r.POST("/projects", func(c *gin.Context) {
 		user, err := currentUser(c, svc)
@@ -67,7 +90,7 @@ func RegisterProjectRoutes(r *gin.RouterGroup, svc *service.Service) {
 				fail(c, http.StatusNotFound, err)
 				return
 			}
-			fail(c, http.StatusInternalServerError, err)
+			failService(c, err)
 			return
 		}
 		ok(c, detail)
@@ -308,6 +331,85 @@ func RegisterProjectRoutes(r *gin.RouterGroup, svc *service.Service) {
 		}
 		ok(c, gin.H{"assets": assets})
 	})
+	r.GET("/projects/:id/asset-folders", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		folders, err := svc.ProjectAssetFolders(user.ID, c.Param("id"))
+		if err != nil {
+			if service.IsProjectNotFound(err) {
+				fail(c, http.StatusNotFound, err)
+				return
+			}
+			failService(c, err)
+			return
+		}
+		ok(c, gin.H{"folders": folders})
+	})
+	r.POST("/projects/:id/asset-folders", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
+		var req service.CreateProjectAssetFolderRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		folder, err := svc.CreateProjectAssetFolder(user.ID, c.Param("id"), req)
+		if err != nil {
+			if service.IsProjectNotFound(err) {
+				fail(c, http.StatusNotFound, err)
+				return
+			}
+			failService(c, err)
+			return
+		}
+		ok(c, gin.H{"folder": folder})
+	})
+	r.PATCH("/projects/:id/asset-folders/:folderId", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
+		var req service.UpdateProjectAssetFolderRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		folder, err := svc.UpdateProjectAssetFolder(user.ID, c.Param("id"), c.Param("folderId"), req)
+		if err != nil {
+			if service.IsProjectNotFound(err) {
+				fail(c, http.StatusNotFound, err)
+				return
+			}
+			failService(c, err)
+			return
+		}
+		ok(c, gin.H{"folder": folder})
+	})
+	r.DELETE("/projects/:id/asset-folders/:folderId", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		if err := svc.DeleteProjectAssetFolder(user.ID, c.Param("id"), c.Param("folderId")); err != nil {
+			if service.IsProjectNotFound(err) {
+				fail(c, http.StatusNotFound, err)
+				return
+			}
+			failService(c, err)
+			return
+		}
+		ok(c, gin.H{"id": c.Param("folderId")})
+	})
 	r.POST("/projects/:id/characters", func(c *gin.Context) {
 		user, err := currentUser(c, svc)
 		if err != nil {
@@ -448,12 +550,12 @@ func RegisterProjectRoutes(r *gin.RouterGroup, svc *service.Service) {
 			return
 		}
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
-		var req service.UpdateProjectAssetCategoryRequest
+		var req service.UpdateProjectAssetRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		asset, err := svc.UpdateProjectAssetCategory(user.ID, c.Param("id"), c.Param("assetId"), req)
+		asset, err := svc.UpdateProjectAsset(user.ID, c.Param("id"), c.Param("assetId"), req)
 		if err != nil {
 			failService(c, err)
 			return
@@ -633,4 +735,15 @@ func RegisterProjectRoutes(r *gin.RouterGroup, svc *service.Service) {
 		}
 		ok(c, gin.H{"asset": asset})
 	})
+}
+
+func parsePositiveQueryInt(value string, fallback int) (int, error) {
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 {
+		return 0, fmt.Errorf("query parameter must be a positive integer")
+	}
+	return parsed, nil
 }

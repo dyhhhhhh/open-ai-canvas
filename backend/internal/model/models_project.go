@@ -27,6 +27,28 @@ type Resource struct {
 	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
+// ResourceDeletionJob is the durable handoff between database deletion and
+// physical object cleanup. Storage fields are frozen because the Resource row
+// is removed in the same transaction that creates this job.
+type ResourceDeletionJob struct {
+	ID               string                 `json:"id" gorm:"primaryKey;size:36"`
+	UserID           string                 `json:"userId" gorm:"index;size:36"`
+	ResourceID       string                 `json:"resourceId" gorm:"index;size:36"`
+	Provider         string                 `json:"provider" gorm:"size:24"`
+	Endpoint         string                 `json:"endpoint"`
+	Bucket           string                 `json:"bucket" gorm:"size:160"`
+	StorageSettingID string                 `json:"-" gorm:"index;size:36"`
+	ObjectKey        string                 `json:"objectKey" gorm:"index"`
+	Status           ResourceDeletionStatus `json:"status" gorm:"index:idx_resource_deletion_jobs_due,priority:1;size:24"`
+	Attempts         int                    `json:"attempts"`
+	LastError        string                 `json:"lastError" gorm:"type:text"`
+	NextAttemptAt    time.Time              `json:"nextAttemptAt" gorm:"index:idx_resource_deletion_jobs_due,priority:2"`
+	LeaseOwner       string                 `json:"-" gorm:"index;size:120"`
+	LeaseExpiresAt   *time.Time             `json:"-" gorm:"index"`
+	CreatedAt        time.Time              `json:"createdAt"`
+	UpdatedAt        time.Time              `json:"updatedAt"`
+}
+
 type Asset struct {
 	ID               string             `json:"id" gorm:"primaryKey;size:80"`
 	UserID           string             `json:"userId" gorm:"index;size:36;index:idx_assets_user_updated,priority:1"`
@@ -44,7 +66,23 @@ type ProjectAssetLink struct {
 	ID        string    `json:"id" gorm:"primaryKey;size:36"`
 	ProjectID string    `json:"projectId" gorm:"index;size:36;uniqueIndex:idx_project_asset_links_unique,priority:1"`
 	AssetID   string    `json:"assetId" gorm:"index;size:80;uniqueIndex:idx_project_asset_links_unique,priority:2"`
+	FolderID  string    `json:"folderId,omitempty" gorm:"index;size:36"`
+	Position  int       `json:"position" gorm:"index"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+// ProjectAssetFolder 只保存项目内的目录结构；真实媒体仍由 Asset/Resource 唯一持有。
+type ProjectAssetFolder struct {
+	ID        string    `json:"id" gorm:"primaryKey;size:36"`
+	ProjectID string    `json:"projectId" gorm:"index;size:36;uniqueIndex:idx_project_asset_folders_sibling_name,priority:1"`
+	ParentID  string    `json:"parentId,omitempty" gorm:"index;size:36;uniqueIndex:idx_project_asset_folders_sibling_name,priority:2"`
+	Name      string    `json:"name" gorm:"size:240"`
+	NameKey   string    `json:"-" gorm:"size:240;uniqueIndex:idx_project_asset_folders_sibling_name,priority:3"`
+	Style     string    `json:"style" gorm:"size:24"`
+	Theme     string    `json:"theme" gorm:"size:24"`
+	Position  int       `json:"position" gorm:"index"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 type ProjectAssetCandidate struct {

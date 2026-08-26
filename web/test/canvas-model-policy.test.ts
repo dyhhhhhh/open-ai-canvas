@@ -3,8 +3,8 @@ import { describe, expect, test } from "bun:test";
 import { canvasConnectionError } from "../src/lib/canvas/canvas-connection-policy";
 import { assertCanvasImageReferenceLimit, buildGenerationConfig, canvasImageReferenceLimitError, resolveCanvasGenerationModel } from "../src/lib/canvas/canvas-project-generation";
 import { defaultModelCapabilityConfig } from "../src/lib/model-capabilities";
-import { groupModelsByDisplayName, modelCompatibilityError, modelGroupReferenceLimits, resolveCompatibleModel, resolveModelGenerationDefaults } from "../src/lib/model-selection";
-import { defaultConfig, type AiConfig, type ModelChannel } from "../src/stores/use-config-store";
+import { groupModelsByDisplayName, inferVideoOperation, modelCompatibilityError, modelGroupReferenceLimits, resolveCompatibleModel, resolveModelGenerationDefaults } from "../src/lib/model-selection";
+import { defaultConfig, normalizeModelOptionValue, type AiConfig, type ModelChannel } from "../src/stores/use-config-store";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData } from "../src/types/canvas";
 
 function policyConfig(): AiConfig {
@@ -165,6 +165,67 @@ describe("逻辑模型选择", () => {
         };
         expect(resolveCompatibleModel(config, "relay::cinema-text", requirements)).toBe("relay::cinema-audio");
         expect(modelCompatibilityError(config, "relay::cinema-image", requirements)).toContain("参考音频");
+    });
+
+    test("音频仅在单独参考时归类为音频生视频", () => {
+        expect(inferVideoOperation({ textCount: 1, imageCount: 0, videoCount: 0, audioCount: 1, characterCount: 0 })).toBe("audio_to_video");
+        expect(inferVideoOperation({ textCount: 1, imageCount: 1, videoCount: 0, audioCount: 1, characterCount: 0 })).toBe("reference_to_video");
+        expect(inferVideoOperation({ textCount: 1, imageCount: 0, videoCount: 1, audioCount: 1, characterCount: 0 })).toBe("reference_to_video");
+    });
+
+    test("逻辑视频模型将 720 与 720p 视为同一分辨率", () => {
+        const model = "cinema-720p";
+        const channel: ModelChannel = {
+            id: "logical-video",
+            name: "平台视频模型",
+            baseUrl: "/api",
+            apiKey: "system",
+            apiFormat: "openai",
+            scope: "system",
+            models: [model],
+            modelCosts: [{
+                model,
+                capability: "video",
+                billingMode: "per_second",
+                unitPriceMicrocredits: 1,
+                logicalCapabilitySpec: {
+                    version: 1,
+                    capability: "video",
+                    operations: ["text_to_video"],
+                    inputs: {},
+                    options: {
+                        videoSeconds: { min: 1, max: 15, step: 1 },
+                        size: { values: ["16:9"] },
+                        vquality: { values: ["720p"] },
+                        videoGenerateAudio: { values: [false] },
+                        videoWatermark: { values: [false] },
+                    },
+                },
+            }],
+        };
+        const value = `logical-video::${model}`;
+        const config = { ...defaultConfig, channels: [channel], models: [value], videoModels: [value], videoModel: value };
+
+        expect(modelCompatibilityError(config, value, {
+            capability: "video",
+            input: { textCount: 1, imageCount: 0, videoCount: 0, audioCount: 0, characterCount: 0 },
+            options: { size: "16:9", videoSeconds: 6, vquality: "720", videoGenerateAudio: false, videoWatermark: false },
+        })).toBe("");
+    });
+
+    test("已保存的旧 SKU 选择会解析到新的模型家族", () => {
+        const channel: ModelChannel = {
+            id: "managed",
+            name: "平台模型",
+            baseUrl: "/api",
+            apiKey: "system",
+            apiFormat: "openai",
+            scope: "system",
+            models: ["family-seedance-2-5"],
+            modelAliases: { "legacy-seedance-720": "family-seedance-2-5" },
+        };
+
+        expect(normalizeModelOptionValue("managed::legacy-seedance-720", [channel])).toBe("managed::family-seedance-2-5");
     });
 
     test("逻辑模型容量使用同名细分模型的最大值", () => {

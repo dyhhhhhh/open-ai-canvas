@@ -292,7 +292,10 @@ export function defaultModelCapabilityConfig(protocol?: ModelProtocol, model = "
         video.generateAudio = { supported: true, default: true };
     }
     if (protocol === "volcengine-ark-video" || protocol === "newapi-channel-1") video.resolutions = ["480p", "720p", "1080p"];
-    if (protocol === "volcengine-ark-video") video.watermark = { supported: true, default: false };
+    if (protocol === "volcengine-ark-video") {
+        video.watermark = { supported: true, default: false };
+        video.operations.push("reference_to_video", "audio_to_video");
+    }
     if (protocol === "novita-video") {
         video.references.maxImages = 1;
         video.references.maxImageBytes = 10 * 1024 * 1024;
@@ -302,18 +305,35 @@ export function defaultModelCapabilityConfig(protocol?: ModelProtocol, model = "
         video.defaultResolution = "1080p";
     }
     if (protocol === "minimax-h3") {
+		video.references.maxImages = 9;
         video.references.maxVideos = 3;
         video.references.maxAudios = 3;
-        video.references.maxVideoBytes = 200 * 1024 * 1024;
-        video.references.maxAudioBytes = 15 * 1024 * 1024;
+		video.references.maxImageBytes = 64 * 1024 * 1024;
+		video.references.maxVideoBytes = 64 * 1024 * 1024;
+		video.references.maxAudioBytes = 64 * 1024 * 1024;
         video.references.maxVideoDurationSeconds = 15;
         video.references.maxAudioDurationSeconds = 15;
-        video.duration = { selection: "range", min: 1, max: 300, step: 1, default: 6 };
-        video.ratios = ["16:9", "9:16", "1:1"];
+		video.duration = { selection: "range", min: 1, max: 300, step: 1, default: 5 };
+		video.ratios = ["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9"];
         video.resolutions = ["720p", "1080p"];
         video.defaultResolution = "720p";
-        video.generateAudio = { supported: true, default: true };
-        video.operations = ["text_to_video", "image_to_video", "first_last_frame"];
+		video.operations = ["text_to_video", "image_to_video", "first_last_frame", "audio_to_video", "extend", "video_to_video"];
+    }
+    if (protocol === "minimax-video") {
+        video.references.maxImages = 9;
+        video.references.maxImageBytes = 30 * 1024 * 1024;
+        video.references.maxVideos = 3;
+        video.references.maxVideoBytes = 50 * 1024 * 1024;
+        video.references.maxVideoDurationSeconds = 15;
+        video.references.maxAudios = 3;
+        video.references.maxAudioBytes = 15 * 1024 * 1024;
+        video.references.maxAudioDurationSeconds = 15;
+        video.duration = { selection: "enum", values: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], default: 5 };
+        video.ratios = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
+        video.resolutions = ["768P", "2K"];
+        video.defaultResolution = "768P";
+        video.watermark = { supported: true, default: false };
+        video.operations.push("reference_to_video");
     }
     return { version: 1, text, image: defaultImageCapabilityConfig(protocol, model), video };
 }

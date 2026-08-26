@@ -47,14 +47,14 @@ Canvas Agent 默认只监听 `127.0.0.1`。网页第一次带正确 token 连接
 
 ### Codex app 插件
 
-仓库内提供了 Codex app 插件：`plugins/infinite-canvas`。该插件尚未上架公共插件目录，直接搜索不会显示；在 Codex app 中添加本仓库的 marketplace 后即可安装。插件会注册同一个 `infinite-canvas` MCP，并带上画布操作说明。
+仓库内提供了 Codex app 插件：`plugins/yingce`。该插件尚未上架公共插件目录，直接搜索不会显示；在 Codex app 中添加本仓库的 marketplace 后即可安装。插件会注册 `yingce` MCP，并带上画布操作说明。
 
 添加本地 marketplace 时建议使用仓库绝对路径，避免 Codex 从其他工作目录解析失败：
 
 ```bash
-cd /path/to/infinite-canvas
+cd /path/to/open-ai-canvas
 codex plugin marketplace add "$(pwd)"
-codex plugin add infinite-canvas@infinite-canvas-local
+codex plugin add yingce@yingce-local
 ```
 
 插件默认通过 npm 启动 MCP：
@@ -68,13 +68,13 @@ npx -y @ddcat666/open-ai-canvas-agent mcp
 Canvas Agent 启动后，给 Codex 添加 MCP：
 
 ```bash
-codex mcp add infinite-canvas -- npx -y @ddcat666/open-ai-canvas-agent mcp
+codex mcp add yingce -- npx -y @ddcat666/open-ai-canvas-agent mcp
 ```
 
 本仓库开发时可以改成，实际使用建议替换为本机绝对路径：
 
 ```bash
-codex mcp add infinite-canvas -- node /path/to/infinite-canvas/canvas-agent/dist/index.js mcp
+codex mcp add yingce -- node /path/to/open-ai-canvas/canvas-agent/dist/index.js mcp
 ```
 
 Canvas Agent 源码使用 TypeScript 编写，MCP 协议层使用官方 `@modelcontextprotocol/sdk`，工具入参使用 `zod` 描述。
@@ -82,7 +82,7 @@ Canvas Agent 源码使用 TypeScript 编写，MCP 协议层使用官方 `@modelc
 如果希望终端里的 Codex 不被 MCP 审批卡住，可以在 `~/.codex/config.toml` 里给这个 MCP 设置自动放行：
 
 ```toml
-[mcp_servers.infinite-canvas]
+[mcp_servers.yingce]
 command = "npx"
 args = ["-y", "@ddcat666/open-ai-canvas-agent", "mcp"]
 default_tools_approval_mode = "approve"
@@ -91,11 +91,41 @@ default_tools_approval_mode = "approve"
 可用工具：
 
 - `canvas_get_state`
+- `canvas_get_context`
+- `canvas_find_nodes`
+- `canvas_get_node`
+- `canvas_get_connection`
+- `canvas_get_generation_tasks`
+- `canvas_get_resources`
+- `canvas_validate_ops`
 - `canvas_get_selection`
 - `canvas_export_snapshot`
 - `canvas_apply_ops`
+- `canvas_create_workflow`
 - `canvas_create_text_node`
 - `canvas_create_image_prompt_flow`
+
+`canvas_create_workflow` 是创建流水线/节点图的高阶工具，不要把工作流退化成批量文本节点。它会根据节点语义自动选择真实节点类型、按实际尺寸布局、创建默认顺序连线，并复核连接与重叠结果：
+
+| kind | 画布节点类型 | 用途 |
+| --- | --- | --- |
+| `character_cards` | `image` | 角色拆分图片卡片 |
+| `character_three_view` | `image` | 角色正面/侧面/背面三视图 |
+| `storyboard_video` | `video` | 分镜剧情视频 |
+| `script` | `script` | 剧本或分镜文字 |
+
+媒体节点优先提供 `prompt`/`content`；对三个影视语义节点，即使模型漏填提示词，工具也会从工作流标题和节点语义生成最小可用创作提示词。已有画布素材必须先通过 `canvas_find_nodes` 或 `canvas_get_resources` 获取真实 node id，再放入 `referenceNodeIds`。
+
+```json
+{
+  "title": "搞笑修仙小说流水线",
+  "nodes": [
+    { "ref": "cards", "kind": "character_cards", "title": "角色拆分图片卡片" },
+    { "ref": "views", "kind": "character_three_view", "title": "角色三视图", "referenceRefs": ["cards"] },
+    { "ref": "video", "kind": "storyboard_video", "title": "分镜剧情视频", "referenceRefs": ["views"], "runGeneration": false }
+  ]
+}
+```
 
 `canvas_apply_ops` 示例：
 
@@ -113,13 +143,19 @@ default_tools_approval_mode = "approve"
 }
 ```
 
+画布写工具返回的结果包含 `ok`、`message` 和 `data`。`data.snapshot` 是本地 Runtime 写入后的最新快照，`data.verification` 会列出 `createdNodeIds`、`removedNodeIds`、缺失节点/连线、前后状态摘要和生成任务观察结果。生成任务的 `message` 会明确区分“已提交/生成中，尚未完成”和“已完成且资源就绪”；不要只根据节点已经创建就向用户报告生成完成。
+
+推荐的 Agent 工作流是：先调用 `canvas_get_context` 读取语义化上下文和 `stateHash`；不知道节点 id 时调用 `canvas_find_nodes`，已经知道 id 后用 `canvas_get_node` 或 `canvas_get_connection` 做精确复核；需要观察生成中的节点时调用 `canvas_get_generation_tasks`；涉及图片、视频或音频参考时调用 `canvas_get_resources`；复杂写操作先调用 `canvas_validate_ops`，通过后再调用 `canvas_apply_ops`。这样 Agent 不需要猜测节点 id，也不会把 loading/error/占位媒体误判成可用资源。
+
 ## 侧边栏 Codex
 
-本地面板会把提示词发送给 Canvas Agent。Canvas Agent 使用官方 `@openai/codex` CLI 的 `codex app-server --stdio` 启动并复用同一个 Codex thread，启动时会注入 `infinite-canvas` MCP 配置并自动放行 MCP 审批，真正执行画布修改前仍由网页侧边栏二次确认。
+本地面板会把提示词发送给 Canvas Agent。Canvas Agent 使用官方 `@openai/codex` CLI 的 `codex app-server --stdio` 启动并复用同一个 Codex thread，启动时会注入 `yingce` MCP 配置并自动放行 MCP 审批，真正执行画布修改前仍由网页侧边栏二次确认。
 
 侧边栏会展示 Codex 返回的 `thread.started`、`turn.started`、`item.*`、`turn.completed` 等结构化事件；收到 app-server 的 `item/agentMessage/delta` 时，Canvas Agent 会转成 `item.updated`，网页会用同一条消息做真实流式更新，并把工具细节收进运行日志。
 
 侧边栏上传或粘贴的图片会先发到本机 Canvas Agent，再由 Canvas Agent 临时写入本机文件并作为 app-server `localImage` 输入传给 Codex；前端会提示附件体积，单次请求体限制为 30MB。
+
+侧边栏 Composer 中显式提及的网页技能不会被拼接进用户 Prompt。网页把技能 bundle 传给本机 Runtime，Runtime 为当前 turn 临时生成受限的 `SKILL.md`，并通过 Codex app-server 的原生 `skill` 输入项加载；技能不会被复制进文本输入，也不会添加 `$skill-name` 伪标记，turn 完成后删除临时文件。未被用户提及的技能不会进入该 turn。
 
 ## Claude Code
 
@@ -128,13 +164,13 @@ Claude Code Adapter 代码暂时保留，但当前网页侧边栏只开放 Codex
 如果希望 Claude Code 也能操作画布，需要给 Claude Code 添加同一个 MCP。建议用 user scope，避免 Canvas Agent 从不同目录启动时找不到配置：
 
 ```bash
-claude mcp add --scope user --transport stdio infinite-canvas -- npx -y @ddcat666/open-ai-canvas-agent mcp
+claude mcp add --scope user --transport stdio yingce -- npx -y @ddcat666/open-ai-canvas-agent mcp
 ```
 
 本仓库开发时可以改成：
 
 ```bash
-claude mcp add --scope user --transport stdio infinite-canvas -- node /path/to/infinite-canvas/canvas-agent/dist/index.js mcp
+claude mcp add --scope user --transport stdio yingce -- node /path/to/open-ai-canvas/canvas-agent/dist/index.js mcp
 ```
 
-Canvas Agent 调用 Claude Code 时会默认带上 `--allowedTools mcp__infinite-canvas__*`，画布写操作仍由网页侧边栏确认。
+Canvas Agent 调用 Claude Code 时会默认带上 `--allowedTools mcp__yingce__*`，画布写操作仍由网页侧边栏确认。
