@@ -477,6 +477,7 @@ func RegisterAdminRoutes(r *gin.RouterGroup, svc *service.Service) {
 			failService(c, err)
 			return
 		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 		var req service.OSSSettingRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			fail(c, http.StatusBadRequest, err)
@@ -488,6 +489,28 @@ func RegisterAdminRoutes(r *gin.RouterGroup, svc *service.Service) {
 			return
 		}
 		ok(c, gin.H{"setting": setting})
+	})
+	r.POST("/admin/settings/oss/test", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		if !enforceRateLimit(c, "admin-storage-test:"+user.ID, 6, time.Minute) {
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+		var req service.OSSSettingRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		result, err := svc.TestAdminOSSSetting(user, req)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		ok(c, result)
 	})
 	r.GET("/admin/settings/ark-private-assets", func(c *gin.Context) {
 		user, err := currentUser(c, svc)
@@ -783,7 +806,7 @@ func shortSystemProxyPath(rawPath string) (string, string, bool) {
 // as a channel request when a business route returns 404.
 func isReservedAPIPathPrefix(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "admin", "ai", "announcements", "assets", "auth", "canvas-projects", "channels", "diagnostics", "features", "files", "model-catalog", "models", "oauth", "plugins", "projects", "protocols", "public", "resources", "sessions", "settings", "skills", "style-profiles", "tasks", "user-data", "voice-profiles", "wallet":
+	case "admin", "ai", "announcements", "assets", "auth", "canvas-projects", "channels", "diagnostics", "features", "files", "model-catalog", "models", "oauth", "plugins", "projects", "public", "resources", "sessions", "settings", "skills", "style-profiles", "tasks", "user-data", "voice-profiles", "wallet":
 		return true
 	default:
 		return false
@@ -811,6 +834,9 @@ func proxySystemRequestPath(c *gin.Context, svc *service.Service, user *model.Us
 		return
 	}
 	modelName := proxyRequestModelForPath(path, c.GetHeader("Content-Type"), body)
+	if modelName == "" && c.Request.Method == http.MethodGet && path == "/agnesapi" {
+		modelName = strings.TrimSpace(c.Query("model_name"))
+	}
 	protocol := model.ChannelInterfaceType("")
 	capability := "text"
 	var channelModel *model.ChannelModel

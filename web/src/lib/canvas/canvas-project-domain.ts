@@ -6,10 +6,11 @@ import type { CanvasImageAngleParams } from "@/components/canvas/canvas-node-ang
 import type { NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
 import { isFrameNode } from "@/lib/canvas/canvas-frame";
 import { nodeSizeFromRatio } from "@/lib/canvas/canvas-node-size";
-import { canvasResourceMentionToken, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
+import { canvasNodeMentionToken, canvasResourceMentionToken, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
+import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import { scopedLocalStorage } from "@/lib/user-scope";
 import type { GenerationTask } from "@/services/api/task-center";
-import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata, type CanvasWorkspaceMode, type ConnectionHandle, type Position, type StoryboardColumn, type StoryboardRow } from "@/types/canvas";
+import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata, type CanvasNodeTypeId, type CanvasWorkspaceMode, type ConnectionHandle, type Position, type StoryboardColumn, type StoryboardRow } from "@/types/canvas";
 
 const CANVAS_WORKSPACE_MODE_STORAGE_KEY = "canvas-workspace-mode-v1";
 
@@ -32,14 +33,20 @@ export function persistCanvasWorkspaceMode(mode: CanvasWorkspaceMode) {
 }
 
 
-export function createCanvasNode(type: CanvasNodeType, position: Position, metadata?: CanvasNodeMetadata): CanvasNodeData {
-    const spec = getNodeSpec(type);
+export function createCanvasNode(type: CanvasNodeTypeId, position: Position, metadata?: CanvasNodeMetadata): CanvasNodeData {
+    const builtinSpec = type in NODE_DEFAULT_SIZE ? getNodeSpec(type as CanvasNodeType) : undefined;
+    const pluginDefinition = getNodeDefinition(type);
+    const spec = builtinSpec || (pluginDefinition ? { width: pluginDefinition.defaultSize.width, height: pluginDefinition.defaultSize.height, title: pluginDefinition.defaultTitle, metadata: pluginDefinition.defaultMetadata } : undefined);
+    if (!spec) throw new Error(`未注册的画布节点类型：${type}`);
     const id = `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const now = new Date().toISOString();
 
     return {
         id,
         type,
         title: spec.title,
+        createdAt: now,
+        updatedAt: now,
         position: {
             x: position.x - spec.width / 2,
             y: position.y - spec.height / 2,
@@ -232,7 +239,7 @@ export function attachNodeToStoryboardRow(nodes: CanvasNodeData[], connection: P
     if (!scriptNodeId || !linkedNode || !scriptNode) return nodes;
     const row = rowId ? scriptNode.metadata?.storyboard?.rows.find((item) => item.id === rowId) : undefined;
     const videoPrompt = row ? (row.videoMotionPrompt || row.plotDescription).trim() : "";
-    const videoComposerContent = row ? storyboardComposerContent(videoPrompt, storyboardRowReferenceNodeIds(scriptNode, row, nodes, [], false)) : "";
+    const videoComposerContent = row ? storyboardComposerContent(videoPrompt, storyboardRowReferenceNodeIds(scriptNode, row, nodes, [], false), nodes) : "";
 
     return nodes.map((node) => {
         if (row && node.id === linkedNode.id && scriptNodeId === connection.fromNodeId && node.type === CanvasNodeType.Video) {
@@ -268,7 +275,8 @@ export function expandStoryboardTextMentions(prompt: string, references: CanvasR
     let expanded = prompt;
     references.filter((reference) => reference.active && reference.kind === "text" && reference.text?.trim()).forEach((reference) => {
         const replacement = `【项目设定：${reference.title}】\n${reference.text!.trim()}`;
-        for (const token of [canvasResourceMentionToken(reference), `@${reference.label}`]) {
+        for (const token of [canvasResourceMentionToken(reference), `@${reference.label}`, reference.nodeId ? canvasNodeMentionToken(reference.nodeId) : ""]) {
+            if (!token) continue;
             if (expanded.includes(token)) expanded = expanded.split(token).join(replacement);
         }
     });

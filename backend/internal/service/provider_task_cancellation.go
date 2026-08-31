@@ -31,22 +31,27 @@ const (
 	providerCancellationFailed    providerCancellationOutcome = "failed"
 )
 
-func (s *Service) startProviderCancellationReconciliation() {
-	go func() {
+func (s *Service) startProviderCancellationReconciliation(ctx context.Context) {
+	s.runWorkerLoop(func(ctx context.Context) {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			task, err := s.repo.ClaimNextTaskProviderCancellation("provider-cancel:"+s.workerID, providerCancellationLeaseDuration)
-			if err != nil || task == nil {
-				continue
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				task, err := s.repo.ClaimNextTaskProviderCancellation("provider-cancel:"+s.workerID, providerCancellationLeaseDuration)
+				if err != nil || task == nil {
+					continue
+				}
+				reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				if err := s.reconcileProviderCancellation(reconcileCtx, task); err != nil {
+					_ = s.log(task.UserID, task.ID, "error", "上游取消状态对账失败", err.Error())
+				}
+				cancel()
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := s.reconcileProviderCancellation(ctx, task); err != nil {
-				_ = s.log(task.UserID, task.ID, "error", "上游取消状态对账失败", err.Error())
-			}
-			cancel()
 		}
-	}()
+	})
 }
 
 func (s *Service) requestProviderCancellation(ctx context.Context, task *model.Task) error {
@@ -72,6 +77,22 @@ func (s *Service) requestProviderCancellation(ctx context.Context, task *model.T
 	input, err := s.providerCancellationInput(task)
 	if err != nil {
 		return s.markProviderCancellationUncertain(task, "读取上游取消配置失败，费用待核对："+err.Error())
+	}
+	if isComfyBridgeInterface(input.Config.InterfaceType) {
+		// 尚未领取的请求可以确定取消并退款；已经在本机执行的工作流只能丢弃迟到结果并转人工核对。
+		request, requestErr := s.repo.ComfyBridgeRequest(task.ProviderRequestID)
+		s.CancelComfyBridgeRequest(task.ProviderRequestID)
+		if requestErr == nil && request.Status == "queued" {
+			if err := s.taskBilling().RefundBilling(task.BillingOrderID, "本地 ComfyUI Bridge 请求在领取前取消"); err != nil {
+				return s.markProviderCancellationUncertain(task, "Bridge 请求已取消，但积分退回失败："+err.Error())
+			}
+			now := time.Now()
+			if err := s.repo.UpdateTaskProviderCancellation(task.ID, model.ProviderCancelStatusRequested, model.ProviderCancelStatusConfirmed, "", nil, &now); err != nil {
+				return err
+			}
+			return nil
+		}
+		return s.markProviderCancellationUncertain(task, "本地 ComfyUI Bridge 不支持取消已领取工作流，执行状态待核对")
 	}
 	if !supportsProviderCancellation(input.Config.InterfaceType) {
 		return s.markProviderCancellationUncertain(task, "当前上游协议不支持取消，费用待核对")

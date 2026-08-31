@@ -1,6 +1,7 @@
 import type { CanvasColorGrade } from "@/lib/canvas/canvas-color-grade";
 import type { PortraitTextureSettings } from "@/lib/canvas/canvas-portrait-texture";
 import type { StyleExecutionPlan } from "@/lib/canvas/style-profile";
+import type { PortraitClearanceNodeState } from "@/lib/portrait-clearance/contracts";
 import type { SrtEntry, SubtitleHighlight, SubtitleStyle } from "@/types/timeline";
 
 export type Position = {
@@ -24,8 +25,6 @@ export enum CanvasNodeType {
     Video = "video",
     Audio = "audio",
     Frame = "frame",
-    // 扩展节点：展示与加工。新增一个成员后，编译器会逐个点出还缺哪张表
-    // （NODE_DEFAULT_SIZE / NODE_SPECS / 节点注册表定义 / nodeContentRenderers）。
     Markdown = "markdown",
     Svg = "svg",
     Html = "html",
@@ -33,6 +32,14 @@ export enum CanvasNodeType {
     Compare = "compare",
     Chart = "chart",
     ColorGrade = "colorgrade",
+}
+
+/** Runtime IDs contributed by plugins share the persisted node type field. */
+export type PluginCanvasNodeType = string & { readonly __pluginCanvasNodeType?: unique symbol };
+export type CanvasNodeTypeId = CanvasNodeType | PluginCanvasNodeType;
+
+export function isBuiltinCanvasNodeType(type: CanvasNodeTypeId): type is CanvasNodeType {
+    return Object.values(CanvasNodeType).includes(type as CanvasNodeType);
 }
 
 export type CanvasNodeStatus = "idle" | "success" | "loading" | "error";
@@ -163,6 +170,10 @@ export type CanvasSkillSnapshot = {
 };
 
 export type CanvasNodeMetadata = {
+    /** Namespaced extension ownership for nodes contributed by a unified plugin. */
+    pluginId?: string;
+    pluginNodeId?: string;
+    pluginData?: Record<string, unknown>;
     importSource?:
         | {
               provider: "libtv";
@@ -194,10 +205,17 @@ export type CanvasNodeMetadata = {
     generationErrorCode?: string;
     resourceReloadAvailable?: boolean;
     failedPromptFingerprint?: string;
+    lastGenerationRequestFingerprint?: string;
     fontSize?: number;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;
+    workflowProvider?: "model" | "runninghub" | "comfyui";
+    runningHubWorkflowId?: string;
+    runningHubWorkflowKind?: "workflow" | "app";
+    comfyBridgeWorkflowId?: string;
+    /** 当前画布节点覆盖的工作流动态字段，键为 source:* 或 field:nodeId:fieldName。 */
+    workflowParameters?: Record<string, unknown>;
     size?: string;
     quality?: string;
     transparentBackground?: string;
@@ -235,6 +253,9 @@ export type CanvasNodeMetadata = {
     stylePresetId?: string;
     styleProfileJson?: string;
     styleExecutionPlan?: StyleExecutionPlan;
+    skillIds?: string[];
+    skillVersions?: Array<{ skillId: string; versionId: string; version: string }>;
+    skillFiles?: Array<{ skillId: string; path: string; sha256?: string }>;
     chapterId?: string;
     chapterTitle?: string;
     shotIndex?: number;
@@ -302,6 +323,8 @@ export type CanvasNodeMetadata = {
     videoCameraMovePrompt?: string;
     videoStartFrameNodeId?: string;
     videoEndFrameNodeId?: string;
+    videoFrameSourceNodeId?: string;
+    videoFrameTimeMs?: number;
     versionOfNodeId?: string;
     versionLabel?: string;
     versionPrimary?: boolean;
@@ -382,12 +405,16 @@ export type CanvasNodeMetadata = {
         editMode?: "provider-mask" | "local-composite";
     };
     portraitTexture?: PortraitTextureSettings;
+    /** 肖像排查节点只保存可恢复的 UI 状态，不保存图片、embedding 或完整结果。 */
+    portraitClearance?: PortraitClearanceNodeState;
 };
 
 export type CanvasNodeData = {
     id: string;
-    type: CanvasNodeType;
+    type: CanvasNodeTypeId;
     title: string;
+    createdAt?: string;
+    updatedAt?: string;
     position: Position;
     width: number;
     height: number;
@@ -415,7 +442,7 @@ export type CanvasDisplayConnection = {
 
 export type CanvasAssistantReference = {
     id: string;
-    type: CanvasNodeType;
+    type: CanvasNodeTypeId;
     title: string;
     dataUrl?: string;
     storageKey?: string;
@@ -480,6 +507,7 @@ export type ContextMenuState =
           x: number;
           y: number;
           position: Position;
+          createOpen?: boolean;
       }
     | {
           type: "node";
